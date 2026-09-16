@@ -191,12 +191,13 @@ Use a 3D encoder-decoder with skip connections:
 ```text
 input: 3 x 64 x 64 x 64 anchor-mask tensor
 encoder: 64^3 -> 32^3 -> 16^3 -> 8^3
-bottleneck: 8^3 visual feature grid
+grounding: 16^3 stage2 grid (4,096 spatial tokens)
+bottleneck: 8^3 visual feature grid (512 spatial tokens)
 decoder: 8^3 -> 16^3 -> 32^3 -> 64^3
 output: one target logit volume at 64^3
 ```
 
-The 8³ bottleneck contains only 512 spatial tokens, making global cross-attention practical. Do not apply full-resolution 64³ global attention, which would create 262,144 spatial tokens. Start with configurable channels such as `32, 64, 128, 256`, with a smaller laptop smoke configuration.
+Clauses are grounded on the 16³ stage2 grid: 4,096 spatial tokens against three keys per clause, one cell per four voxels, which is fine enough to place a structure of radius ~5 voxels. The 8³ bottleneck keeps its 512 spatial tokens and stays the global-context grid and the structure encoder's input; it is too coarse to localise a target, and a decoder that only scales and shifts channels cannot move a peak that is already in the wrong cell. Grounding at 32³ (32,768 tokens) or full-resolution 64³ (262,144 tokens) is forbidden. Start with configurable channels such as `32, 64, 128, 256`, with a smaller laptop smoke configuration.
 
 ### Anchor structure encoder
 
@@ -218,13 +219,13 @@ relation_token_i = direction_embedding_i
 The target is not inside an anchor. It is the object satisfying all three target-relative constraints. Use three independent relation-conditioned branches:
 
 1. fuse relation token `i` with structure token `i` using a small cross-attention block or gated MLP;
-2. broadcast the resulting relation token to the bottleneck visual grid;
+2. broadcast the resulting relation token to the 16³ grounding grid;
 3. compute a relation-specific spatial evidence map `H_i`;
 4. combine `H_1`, `H_2`, and `H_3` using an explicit intersection module.
 
 The intersection module may receive `[H_1, H_2, H_3, H_1*H_2*H_3]` through a pointwise fusion block. It must not collapse the three `(direction, anchor)` pairs into one pooled text vector before spatial grounding.
 
-Use bottleneck visual locations as queries and relation/structure tokens as keys/values for the main cross-attention. Add lightweight FiLM/gating or cross-attention conditioning at the 16³ and 32³ decoder stages. Do not use expensive full-resolution global attention.
+Use the 4,096 stage2 visual locations at 16³ as queries and relation/structure tokens as keys/values for the main cross-attention. Add lightweight FiLM/gating or cross-attention conditioning at the 16³ and 32³ decoder stages. Do not use expensive full-resolution global attention: 32³ and 64³ grounding stay forbidden.
 
 ### Position embeddings and decoder
 

@@ -5,6 +5,11 @@ inject the relation-fused context, and refine with 3D convolutions. The head
 returns one target logit volume at the input resolution; evaluation also asks
 for sigmoid probabilities and a thresholded binary mask.
 
+The bottleneck arriving here is *unconditioned* global context. The relational
+evidence is grounded at 16^3 and added to the first skip
+(:mod:`src.models.relational_vlm`), so it enters at the resolution it was
+computed on instead of being upsampled from an 8-voxel grid.
+
 Conditioning at 16^3 and 32^3 is FiLM - a per-channel affine modulation
 predicted from the three fused clause tokens, concatenated in clause order so
 the context keeps the correspondence between slot, direction and anchor. FiLM is
@@ -56,7 +61,7 @@ class RelationalDecoder(nn.Module):
     """The Stage B decoder and target head.
 
     Args:
-        bottleneck_channels: width of the conditioned bottleneck grid.
+        bottleneck_channels: width of the encoder's bottleneck grid.
         skip_channels: encoder widths at 1/4, 1/2 and full resolution.
         decoder_channels: output widths of the three decoder stages.
         context_dim: width of the flattened clause context.
@@ -156,8 +161,9 @@ class RelationalDecoder(nn.Module):
         """``-> [B, out_channels, D, H, W]`` target logits.
 
         Args:
-            bottleneck: the intersection-conditioned ``[B, C, 8, 8, 8]`` grid.
-            skips: encoder features at 1/4, 1/2 and full resolution.
+            bottleneck: the ``[B, C, 8, 8, 8]`` encoder bottleneck, unconditioned.
+            skips: encoder features at 1/4, 1/2 and full resolution; the first
+                carries the intersection residual.
             context: ``[B, context_dim]`` relation-fused clause context.
         """
         if len(skips) != 3:

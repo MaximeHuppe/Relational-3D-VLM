@@ -82,6 +82,7 @@ stage_b:
   out_channels: 1                 # single target logit volume at input resolution
   encoder_channels: [32, 64, 128, 256]
   resolutions: [64, 32, 16, 8]    # bottleneck 8^3 = 512 spatial tokens
+                                  # stage2 16^3 = the grounding grid (see fusion)
   bottleneck_resolution: 8
   decoder_channels: [128, 64, 32]
   norm: instance
@@ -121,7 +122,14 @@ stage_b:
     # Three independent relation-conditioned branches, then explicit intersection.
     branch_fusion: cross_attention   # alternative: gated_mlp
     num_heads: 4
-    attention_resolution: 8          # bottleneck queries, relation/structure tokens as keys/values
+    # Full-volume voxels: the grid the clause evidence maps are computed on, with
+    # relation/structure tokens as keys/values. 16 = input / 4 = the encoder's
+    # stage2 output, so 4,096 queries against three keys per clause. The 8^3
+    # bottleneck is one cell per eight voxels: too coarse to hold a peak for a
+    # structure of radius ~5 voxels, and the decoder cannot move a peak
+    # afterwards (FiLM is a per-channel affine). 32 and 64 are the
+    # full-resolution attention CLAUDE.md forbids - 32,768 and 262,144 queries.
+    attention_resolution: 16
     forbid_full_resolution_attention: true
     intersection:
       inputs: [H1, H2, H3, H1_mul_H2_mul_H3]

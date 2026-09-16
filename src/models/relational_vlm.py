@@ -17,12 +17,23 @@ Pipeline::
     anchor_masks + bottleneck         ->  StructureEncoder       -> S [B, 3, E]
 
     per clause i:  ClauseFusion(R_i, S_i) -> C_i
-                   cross-attention (visual queries, {C_i, R_i, S_i} as K/V)
-                   -> evidence map H_i at 8^3
-    IntersectionFusion([H_1, H_2, H_3, H_1*H_2*H_3]) -> conditioned bottleneck
+                   cross-attention (stage2 queries, {C_i, R_i, S_i} as K/V)
+                   -> evidence map H_i at 16^3
+    IntersectionFusion([H_1, H_2, H_3, H_1*H_2*H_3]) -> added to the stage2 skip
 
     RelationalDecoder: 8^3 -> 16^3 -> 32^3 -> 64^3, skips + FiLM at 16^3/32^3
+        the bottleneck enters unconditioned; the relational evidence reaches the
+        decoder at 16^3 through the first skip
     head -> one target logit volume [B, 1, 64, 64, 64]
+
+Clauses are grounded on the encoder's **stage2** grid - 16^3, 4,096 queries
+against three keys, one cell per four voxels - not on the 8^3 bottleneck. An
+8-voxel cell cannot localise a structure of radius ~5 voxels, and the decoder
+cannot repair that afterwards: FiLM is a per-channel scale and shift, the same
+``(gamma, beta)`` at every voxel, so it can sharpen a peak but never move one.
+The bottleneck stays 8^3 - the 512-token budget CLAUDE.md sets - and remains the
+global-context grid and the structure encoder's input. Grounding at 32^3 (32,768
+queries) or 64^3 (262,144) stays impossible to construct.
 
 Anchor source is *not* this model's concern. It consumes whatever three ordered
 channels it is handed: ground-truth masks from ``instance_labels`` (Phase 3,
@@ -92,6 +103,10 @@ class RelationalVLMConfig:
     align_corners: bool = True
     input_resolution: int = 64
     bottleneck_resolution: int = 8
+    #: Grid the clause evidence maps are computed on, in full-volume voxels: the
+    #: encoder's stage2 output. ``None`` resolves to ``input_resolution // 4``
+    #: (16 on the default 64^3 model, 4 on a 16^3 fixture).
+    attention_resolution: int | None = None
     out_channels: int = 1
     num_clauses: int = NUM_CLAUSES
     token_dim: int = 256
@@ -150,6 +165,21 @@ class RelationalVLMConfig:
                 f"a {self.bottleneck_resolution}^3 bottleneck is "
                 f"{self.bottleneck_resolution ** 3} attention tokens; CLAUDE.md budgets 512"
             )
+        if self.attention_resolution is None:
+            object.__setattr__(self, "attention_resolution", self.input_resolution // 4)
+        # A separate cap from the bottleneck's: these are the grounding queries.
+        if self.attention_resolution**3 > 4096:
+            raise ValueError(
+                f"a {self.attention_resolution}^3 grounding grid is "
+                f"{self.attention_resolution ** 3} attention queries; full-resolution "
+                "attention is forbidden and grounding budgets 4096"
+            )
+        if self.attention_resolution != self.input_resolution // 4:
+            raise ValueError(
+                f"clauses are grounded on the encoder's stage2 grid, so attention_resolution "
+                f"must be {self.input_resolution // 4} for a {self.input_resolution}^3 input, "
+                f"got {self.attention_resolution}"
+            )
 
     @property
     def in_channels(self) -> int:
@@ -161,12 +191,18 @@ class RelationalVLMConfig:
         return int(self.encoder_channels[-1])
 
     @property
+    def grounding_channels(self) -> int:
+        """Encoder stage2 width: the feature grid the clauses are grounded on."""
+        return int(self.encoder_channels[-2])
+
+    @property
     def evidence_width(self) -> int:
         return int(self.evidence_channels or self.bottleneck_channels)
 
     @property
     def grid_shape(self) -> tuple[int, int, int]:
-        return (self.bottleneck_resolution,) * 3
+        """Grounding grid ``(D', H', W')``: stage2, one cell per four voxels."""
+        return (int(self.attention_resolution),) * 3
 
     @property
     def volume_shape(self) -> tuple[int, int, int]:
@@ -211,7 +247,22 @@ class RelationalVLMConfig:
         fusion = stage["fusion"]
         structure = stage["structure_encoder"]
         prompt = stage["prompt_encoder"]
-        resolution = int(input_resolution or stage["resolutions"][0])
+        declared = int(stage["resolutions"][0])
+        resolution = int(input_resolution or declared)
+        if not bool(fusion.get("forbid_full_resolution_attention", True)):
+            raise ValueError(
+                "forbid_full_resolution_attention cannot be switched off: CLAUDE.md rules out "
+                "32^3 and 64^3 global attention"
+            )
+        # `attention_resolution` is stated in voxels of the declared input (16 on
+        # the 64^3 model). Carry it as an encoder stride, so a model built at
+        # another resolution grounds on the same encoder stage rather than on an
+        # absolute grid that no longer exists there.
+        grounding = int(fusion.get("attention_resolution", declared // 4))
+        if grounding <= 0 or declared % grounding:
+            raise ValueError(
+                f"attention_resolution must divide the declared {declared}^3 input, got {grounding}"
+            )
         return cls.for_variant(
             variant,
             encoder_channels=tuple(int(v) for v in stage["encoder_channels"]),
@@ -219,6 +270,7 @@ class RelationalVLMConfig:
             activation=str(stage["activation"]),
             input_resolution=resolution,
             bottleneck_resolution=resolution // 8,
+            attention_resolution=resolution // (declared // grounding),
             out_channels=int(stage["out_channels"]),
             token_dim=int(structure["token_dim"]),
             embedding_dim=int(prompt["embedding_dim"]),
@@ -244,7 +296,7 @@ class RelationalVLMOutput:
     """Forward result: the target logit volume, plus optional diagnostics."""
 
     logits: Tensor                       # [B, 1, D, H, W]
-    evidence: list[Tensor] | None = None  # three 8^3 maps, when asked for
+    evidence: list[Tensor] | None = None  # three 16^3 maps (input/4), when asked for
     clause_tokens: Tensor | None = None   # [B, 3, E] fused clause tokens
 
     def probabilities(self) -> Tensor:
@@ -288,7 +340,7 @@ class RelationalVLM(nn.Module):
             volume_shape=cfg.volume_shape,
         )
         self.fusion = CrossModalFusion(
-            cfg.bottleneck_channels,
+            cfg.grounding_channels,
             cfg.token_dim,
             cfg.evidence_width,
             num_clauses=cfg.num_clauses,
@@ -301,7 +353,7 @@ class RelationalVLM(nn.Module):
         self.intersection = IntersectionFusion(
             cfg.evidence_width,
             cfg.intersection_hidden_channels,
-            cfg.bottleneck_channels,
+            cfg.grounding_channels,
             num_clauses=cfg.num_clauses,
             activation=cfg.activation,
         )
@@ -361,7 +413,8 @@ class RelationalVLM(nn.Module):
                 slot. Channel ``i`` must be the anchor named in clause ``i``.
             direction_ids: ``[B, 3]`` zero-based direction indices.
             anchor_shape_ids: ``[B, 3]`` zero-based shape indices.
-            return_evidence: also return the three 8^3 evidence maps.
+            return_evidence: also return the three evidence maps, one per
+                clause, on the grounding grid (16^3 at the default resolution).
         """
         if direction_ids.shape != anchor_shape_ids.shape:
             raise ValueError(
@@ -381,12 +434,17 @@ class RelationalVLM(nn.Module):
         relation_tokens = self.prompt_encoder(direction_ids, anchor_shape_ids)
         structure_tokens = self.structure_encoder(masks, features.bottleneck, anchor_shape_ids)
         evidence, clause_tokens = self.fusion(
-            features.bottleneck, relation_tokens, structure_tokens
+            features.stage2, relation_tokens, structure_tokens
         )
-        conditioned = features.bottleneck + self.intersection(evidence)
+        # The relational evidence enters the decoder at stage2's resolution through
+        # the first skip, which is how a U-Net carries high-resolution signal. The
+        # bottleneck is left unconditioned: it is global context, and a residual
+        # added there would only be upsampled back to this grid anyway.
+        conditioned_stage2 = features.stage2 + self.intersection(evidence)
+        skips = (conditioned_stage2, features.stage1, features.stem)
         context = clause_tokens.flatten(1)
         logits = self.decoder(
-            conditioned, features.skips, context, full_shape=volume_shape
+            features.bottleneck, skips, context, full_shape=volume_shape
         )
         return RelationalVLMOutput(
             logits=logits,

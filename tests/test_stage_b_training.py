@@ -352,10 +352,15 @@ def test_autocast_is_disabled_on_cpu_where_it_is_a_30x_regression():
 
 
 def test_a_few_stage_b_steps_reduce_the_loss(dataset, tmp_path):
+    # Eight optimiser steps at a deliberately large step size, on four examples.
+    # The head starts at the foreground prior, so the epoch-mean loss is ~1.0083
+    # of which Dice is 0.9972: four small steps move it by ~1e-5, which is not a
+    # signal, only the sign of the noise. This budget costs the same wall clock
+    # (same data per epoch) and moves the loss by ~1e-4.
     seed_everything(0)
-    loader = build_example_dataloader(dataset, batch_size=2)
+    loader = build_example_dataloader(dataset, batch_size=1)
     settings = TrainingSettings(
-        epochs=2, batch_size=2, device="cpu", learning_rate=5e-3, warmup_epochs=0, seed=0
+        epochs=2, batch_size=1, device="cpu", learning_rate=5e-2, warmup_epochs=0, seed=0
     )
     trainer = StageBTrainer(
         RelationalVLM(SMALL), settings, loader, loader, output_dir=tmp_path, verbose=False

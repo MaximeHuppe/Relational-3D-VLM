@@ -10,7 +10,10 @@ Source: `src/models/relational_vlm.py` and the six modules it composes
 (`relational_encoder`, `structure_encoder`, `prompt_encoder`,
 `cross_modal_fusion`, `intersection_fusion`, `decoder`). Configuration:
 `configs/model.yaml` (`stage_b`), `configs/train.yaml` (`stage_b_*`).
-Figure: `docs/flowchart/phase2_model.drawio` (Architecture + Training-Data-Eval).
+Figure: `docs/flowchart/phase2_model.drawio` (Architecture + Training-Data-Eval)
+— **stale**: it still draws clause attention over the 8³ bottleneck with the
+intersection residual added there, and needs redrawing for the 16³ grounding
+described below.
 
 ## What the model may see
 
@@ -42,14 +45,15 @@ anchor_masks [B, 3, 64, 64, 64]        direction_ids, anchor_shape_ids [B, 3]
 
 per clause i (weights shared across i):
   ClauseFusion(R_i, S_i) -> C_i
-  EvidenceHead: queries = 512 bottleneck locations (+ PE3D)
+  EvidenceHead: queries = 4,096 stage2 locations at 16^3 (+ PE3D)
                 keys/values = {C_i, R_i, S_i}
-                -> H_i [B, Ce, 8, 8, 8]
+                -> H_i [B, Ce, 16, 16, 16]
 
 IntersectionFusion([H_1, H_2, H_3, sigmoid(H_1)*sigmoid(H_2)*sigmoid(H_3)])
-  1x1 conv -> hidden -> 1x1 conv -> C4,  added to the bottleneck
+  1x1 conv -> hidden -> 1x1 conv -> C3,  added to the stage2 skip
 
 RelationalDecoder  8^3 -> 16^3 -> 32^3 -> 64^3
+  the bottleneck enters unconditioned; skips = (conditioned stage2, stage1, stem)
   upsample, concat encoder skip, FiLM(context) at 16^3 and 32^3, 3D conv refine
   head (1x1) -> target logits [B, 1, 64, 64, 64]
 ```
@@ -59,6 +63,32 @@ RelationalDecoder  8^3 -> 16^3 -> 32^3 -> 64^3
 spatial map — never before grounding.
 
 ## Design decisions
+
+### Clauses are grounded at 16³, not at the bottleneck
+
+The evidence maps are computed on the encoder's stage2 grid — 4,096 queries
+against three keys per clause — and the intersection residual is added to the
+stage2 skip. The 8³ bottleneck keeps its other two jobs unchanged: 512 tokens of
+global context for the decoder's first upsample, and the structure encoder's
+input.
+
+An 8³ grid is one cell per eight voxels. Objects in this corpus have a radius of
+roughly five voxels, so a peak on that grid cannot name a position to better than
+the object's own diameter — the measured Phase 3 centroid error, ~7 voxels, is
+one bottleneck cell. The decoder cannot repair that afterwards: FiLM is a
+per-channel scale and shift, the same `(γ, β)` at every voxel, so it can sharpen
+or suppress a peak but never move one. Starting the decoder at 16³ while still
+computing `H_i` at 8³ would only upsample the same coarse field. 16³ cells are
+four voxels wide, fine enough to place a five-voxel-radius object, and the
+relational signal now enters the decoder at that resolution through the skip —
+which is how a U-Net carries high-resolution signal — instead of being upsampled
+from the coarsest grid in the network.
+
+The cost is 4,096 queries against 3 keys per clause: eight times the previous
+512-token grounding, still eight times cheaper than 32³ and sixty-four times
+cheaper than 64³. Both of those remain impossible to construct —
+`RelationalVLMConfig` caps the grounding grid at 4,096 queries and pins it to
+`input_resolution // 4` (`configs/model.yaml: stage_b.fusion.attention_resolution`).
 
 ### Geometry is measured from the masks, not read from the manifest
 
@@ -108,8 +138,9 @@ anchor shape, the `(direction, shape)` pair and the slot. Set the flag to
 
 Conditioning at 16³ and 32³ is a per-channel affine modulation predicted from the
 clause context, zero-initialised so it starts as the identity. Attention at 32³
-would mean 32,768 query tokens per sample — sixty-four times the bottleneck
-budget CLAUDE.md sets. Only the stages named in
+would mean 32,768 query tokens per sample — eight times the 16³ grounding grid
+and sixty-four times the 512-token bottleneck budget CLAUDE.md sets. Only the
+stages named in
 `fusion.decoder_conditioning.at_resolutions` own a FiLM block; a stage that is
 never conditioned does not carry dead parameters.
 
@@ -169,8 +200,8 @@ this milestone.
 
 | Profile | Encoder / decoder widths | Token width | Parameters |
 | --- | --- | --- | --- |
-| `default` | `[32, 64, 128, 256]` / `[128, 64, 32]` | 256 | 13.7 M |
-| `smoke` | `[8, 16, 32, 64]` / `[32, 16, 8]` | 64 | 0.88 M |
+| `default` | `[32, 64, 128, 256]` / `[128, 64, 32]` | 256 | 12.3 M |
+| `smoke` | `[8, 16, 32, 64]` / `[32, 16, 8]` | 64 | 0.79 M |
 
 ## Portability notes, measured
 
