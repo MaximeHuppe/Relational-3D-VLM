@@ -9,6 +9,10 @@ alongside it so the block can also learn softer combinations.
 The three ``(direction, anchor)`` pairs are never collapsed into one pooled text
 vector before this point - by the time anything is pooled, each clause has
 already produced its own spatial map.
+
+All of this happens on the grounding grid - the encoder's stage2 output, 16^3 at
+the default resolution - and the fused result is added to the stage2 skip on its
+way into the decoder (:mod:`src.models.relational_vlm`).
 """
 
 from __future__ import annotations
@@ -28,8 +32,8 @@ class IntersectionFusion(nn.Module):
     Args:
         evidence_channels: width of each ``H_i``.
         hidden_channels: width inside the fusion block.
-        out_channels: width of the grid handed to the decoder (the bottleneck
-            width, so the result can be added to the visual features).
+        out_channels: width of the grid this residual is added to - the
+            encoder's stage2 width, so it can be added to the stage2 skip.
         num_clauses: 3.
         normalize_product: scale each map to ``[0, 1]`` with a sigmoid before
             multiplying. Without it the product of three unbounded activations

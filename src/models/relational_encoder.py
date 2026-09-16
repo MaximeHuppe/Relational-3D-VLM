@@ -1,9 +1,14 @@
 """Stage B visual encoder over the ordered anchor-mask channels.
 
-``3 x 64^3 -> 32^3 -> 16^3 -> 8^3``. The 8^3 bottleneck holds 512 spatial
-tokens, which is what makes global cross-attention affordable; full-resolution
-attention over 262,144 tokens is explicitly forbidden by CLAUDE.md and never
-happens here.
+``3 x 64^3 -> 32^3 -> 16^3 -> 8^3``. Attention is affordable because it runs on
+a coarse grid: 4,096 stage2 locations for grounding, 512 in the bottleneck.
+Full-resolution attention over 262,144 tokens is explicitly forbidden by
+CLAUDE.md and never happens here.
+
+``stage2`` (1/4 of the input, 16^3 by default) is the grounding grid: the clause
+evidence maps are computed there and the intersection residual is added to that
+same skip (:mod:`src.models.cross_modal_fusion`). The 8^3 bottleneck feeds the
+structure encoder and the decoder's first upsample.
 
 The encoder sees *only* the anchor channels. There is no scene volume, no
 instance labels and no target mask anywhere in this file - the target is not an
@@ -38,12 +43,16 @@ class EncoderFeatures:
 
     stem: Tensor        # [B, C1, D, H, W]
     stage1: Tensor      # [B, C2, D/2, H/2, W/2]
-    stage2: Tensor      # [B, C3, D/4, H/4, W/4]
+    stage2: Tensor      # [B, C3, D/4, H/4, W/4] - the grounding grid
     bottleneck: Tensor  # [B, C4, D/8, H/8, W/8]
 
     @property
     def skips(self) -> tuple[Tensor, Tensor, Tensor]:
-        """Skips in decoder order: 1/4, 1/2, full."""
+        """Skips in decoder order: 1/4, 1/2, full.
+
+        Stage B replaces the first of these with its conditioned copy, so the
+        relational evidence reaches the decoder at 1/4 resolution.
+        """
         return (self.stage2, self.stage1, self.stem)
 
     @property

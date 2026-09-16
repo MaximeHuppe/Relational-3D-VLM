@@ -2,8 +2,9 @@
 
 Covers the promises the relational architecture makes, not its accuracy:
 
-* the target logit volume comes back at the input resolution, from a 512-token
-  bottleneck - full-resolution attention is never built;
+* the target logit volume comes back at the input resolution; clauses are
+  grounded on the encoder's stage2 grid (16^3, 4,096 queries) while the
+  bottleneck stays 512 tokens, and full-resolution attention is never built;
 * the forward signature cannot accept the scene, the labels, the target mask or
   any target identity, and the dataset's input helper hands over nothing else;
 * the natural-language and structured prompt paths produce the same three
@@ -19,12 +20,14 @@ Covers the promises the relational architecture makes, not its accuracy:
 
 from __future__ import annotations
 
+import copy
 import inspect
 
 import numpy as np
 import pytest
 import torch
 
+from src.config import load_config
 from src.data.direction_rules import DIRECTIONS, bbox_extent_world, centroid_world
 from src.data.prompt_generator import clause_indices, clauses_from_indices
 from src.data.schema import STAGE_B_FORBIDDEN_FIELDS
@@ -134,12 +137,63 @@ def test_the_bottleneck_is_the_512_token_budget_claude_md_sets():
         RelationalVLMConfig(input_resolution=64, bottleneck_resolution=16)
 
 
-def test_evidence_maps_live_at_the_bottleneck_not_at_full_resolution(model):
+def test_evidence_maps_live_at_stage2_not_at_the_bottleneck_or_full_resolution(model):
+    """Grounding is one cell per four voxels, not one per eight and not per one."""
     output = model(anchors(1), *prompt_ids(1), return_evidence=True)
     assert len(output.evidence) == 3
+    stage2 = TINY.input_resolution // 4                       # 4 on TINY, 16 at 64^3
     for evidence in output.evidence:
-        assert tuple(evidence.shape[2:]) == (2, 2, 2)  # the TINY bottleneck
+        assert tuple(evidence.shape[2:]) == (stage2,) * 3
+        assert tuple(evidence.shape[2:]) != (TINY.bottleneck_resolution,) * 3
+        assert tuple(evidence.shape[2:]) != (TINY.input_resolution,) * 3
     assert output.clause_tokens.shape == (1, 3, TINY.token_dim)
+
+
+def test_the_64_cubed_model_grounds_at_16_and_still_returns_the_full_volume():
+    """The shapes the architecture promises, on the real 64^3 skeleton."""
+    assert RelationalVLMConfig.from_config().grid_shape == (16, 16, 16)
+    net = build_relational_vlm("smoke")   # same 64^3 skeleton, narrower widths
+    with torch.no_grad():
+        output = net(torch.zeros(1, 3, 64, 64, 64), *prompt_ids(1), return_evidence=True)
+    assert output.logits.shape == (1, 1, 64, 64, 64)
+    for evidence in output.evidence:
+        assert tuple(evidence.shape) == (1, net.config.evidence_width, 16, 16, 16)
+
+
+def test_grounding_is_pinned_to_stage2_and_finer_attention_cannot_be_built():
+    config = RelationalVLMConfig.from_config(profile="smoke")
+    assert config.attention_resolution == config.input_resolution // 4 == 16
+    assert config.attention_resolution**3 == 4096            # queries per clause
+    assert config.grounding_channels == config.encoder_channels[-2]
+    for forbidden in (32, 64):       # 32,768 and 262,144 queries: CLAUDE.md says no
+        with pytest.raises(ValueError):
+            RelationalVLMConfig(attention_resolution=forbidden)
+    with pytest.raises(ValueError):  # and the 8^3 bottleneck is too coarse to place a target
+        RelationalVLMConfig(attention_resolution=8)
+
+
+def test_the_full_resolution_ban_cannot_be_switched_off_in_the_config():
+    config = copy.deepcopy(load_config("model"))
+    config["stage_b"]["fusion"]["forbid_full_resolution_attention"] = False
+    with pytest.raises(ValueError):
+        RelationalVLMConfig.from_config(config)
+
+
+def test_the_intersection_residual_is_the_width_of_the_stage2_skip(model):
+    """It is added to stage2, so it carries stage2's width, not the bottleneck's."""
+    assert TINY.grounding_channels != TINY.bottleneck_channels   # the two are distinct here
+    masks = anchors(1)
+    directions, shapes = prompt_ids(1)
+    with torch.no_grad():
+        features = model.encoder(masks, (16, 16, 16))
+        evidence, _ = model.fusion(
+            features.stage2,
+            model.prompt_encoder(directions, shapes),
+            model.structure_encoder(masks, features.bottleneck, shapes),
+        )
+        residual = model.intersection(evidence)
+    assert residual.shape == features.stage2.shape
+    assert (features.stage2 + residual).shape == features.stage2.shape
 
 
 def test_the_head_starts_at_the_foreground_prior_not_at_one_half(model):

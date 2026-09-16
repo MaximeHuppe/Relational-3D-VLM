@@ -7,15 +7,20 @@ first, and only then intersected (:mod:`src.models.intersection_fusion`).
 For clause ``i``:
 
 1. :class:`ClauseFusion` fuses relation token ``i`` with structure token ``i``;
-2. the fused clause token is broadcast over the 8^3 bottleneck grid through
-   cross-attention where the **visual locations are the queries** and the
-   clause's three tokens (fused, relation, structure) are the keys/values;
+2. the fused clause token is broadcast over the encoder's 16^3 stage2 grid
+   through cross-attention where the **visual locations are the queries** and
+   the clause's three tokens (fused, relation, structure) are the keys/values;
 3. a small convolutional head turns the attended grid into the relation-specific
    evidence map ``H_i``.
 
-Attention happens only at 8^3 - 512 tokens. Full-resolution attention (262,144
-tokens) is forbidden by CLAUDE.md and never occurs; the decoder gets conditioned
-by FiLM instead (:mod:`src.models.decoder`).
+Grounding happens at 16^3: 4,096 queries against three keys, one cell per four
+voxels. That is the grid the target has to be placed on - the 8^3 bottleneck
+gives one cell per eight voxels, which cannot hold a peak for a structure of
+radius ~5 voxels, and the decoder cannot move a peak afterwards (FiLM is a
+per-channel affine, the same modulation everywhere). Anything finer is what
+CLAUDE.md rules out: 32^3 is 32,768 queries and 64^3 is 262,144. The bottleneck
+keeps its other two jobs - global context for the decoder and the structure
+encoder's input.
 
 Branch weights are shared across the three clauses by default
 (``share_branch_weights``). The branches are independent in the sense that
@@ -87,7 +92,11 @@ class ClauseFusion(nn.Module):
 
 
 class EvidenceHead(nn.Module):
-    """Attended bottleneck grid -> one relation-specific evidence map ``H_i``."""
+    """Attended stage2 grid -> one relation-specific evidence map ``H_i``.
+
+    ``grid_shape`` is the grounding grid the positional encoding is built for;
+    the runtime grid must match it, so a model is tied to one input resolution.
+    """
 
     def __init__(
         self,
@@ -96,7 +105,7 @@ class EvidenceHead(nn.Module):
         evidence_channels: int,
         *,
         heads: int = 4,
-        grid_shape: Sequence[int] = (8, 8, 8),
+        grid_shape: Sequence[int] = (16, 16, 16),
         activation: str = "leaky_relu",
     ) -> None:
         super().__init__()
@@ -143,7 +152,7 @@ class CrossModalFusion(nn.Module):
         *,
         num_clauses: int = 3,
         heads: int = 4,
-        grid_shape: Sequence[int] = (8, 8, 8),
+        grid_shape: Sequence[int] = (16, 16, 16),
         branch_fusion: str = "cross_attention",
         share_branch_weights: bool = True,
         activation: str = "leaky_relu",
@@ -178,7 +187,7 @@ class CrossModalFusion(nn.Module):
         """``-> ([H_1, H_2, H_3], fused_tokens [B, 3, E])``.
 
         Args:
-            visual: ``[B, C, D', H', W']`` bottleneck features.
+            visual: ``[B, C, D', H', W']`` stage2 features, the grounding grid.
             relation_tokens: ``[B, 3, E]`` from the prompt encoder.
             structure_tokens: ``[B, 3, E]`` from the structure encoder.
         """
