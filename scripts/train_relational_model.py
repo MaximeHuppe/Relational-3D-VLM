@@ -142,6 +142,24 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="split used for evaluation",
     )
     parser.add_argument(
+        "--bce", choices=("plain", "focal"), default=None,
+        help="cross-entropy term of the loss (default: configs/train.yaml). "
+             "focal is ~0.3x the magnitude of plain BCE, so pair it with "
+             "--lambda-bce rather than inheriting the plain weight",
+    )
+    parser.add_argument(
+        "--lambda-bce", type=float, default=None,
+        help="weight on the cross-entropy term (default: configs/train.yaml)",
+    )
+    parser.add_argument(
+        "--focal-gamma", type=float, default=None,
+        help="focal focusing exponent; 0 reduces focal to plain BCE",
+    )
+    parser.add_argument(
+        "--focal-alpha", type=float, default=None,
+        help="focal weight on the positive class, in [0, 1]",
+    )
+    parser.add_argument(
         "--augment", dest="augment", action="store_true", default=None,
         help="rotate the training examples per epoch and rewrite their directions "
              "(default: on for --phase oracle, off for --phase overfit)",
@@ -192,6 +210,10 @@ def build_settings(args: argparse.Namespace) -> TrainingSettings:
             "steps": args.steps,
             "batch_size": args.batch_size,
             "learning_rate": args.learning_rate,
+            "bce_variant": args.bce,
+            "lambda_bce": args.lambda_bce,
+            "focal_gamma": args.focal_gamma,
+            "focal_alpha": args.focal_alpha,
             "device": args.device,
             "seed": args.seed,
             "model_profile": args.model_profile,
@@ -330,6 +352,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"schedule    : {settings.epochs} epochs, batch {settings.batch_size}, "
                 f"lr {settings.learning_rate}, seed {settings.seed}"
             )
+        objective = (
+            f"loss        : {settings.lambda_dice} dice + {settings.lambda_bce} "
+            f"{settings.bce_variant} bce"
+        )
+        if settings.bce_variant == "focal":
+            objective += f" (gamma {settings.focal_gamma}, alpha {settings.focal_alpha})"
+        print(objective)
         print()
 
     # -- run ---------------------------------------------------------------

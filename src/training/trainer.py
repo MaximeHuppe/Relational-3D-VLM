@@ -50,7 +50,14 @@ from src.training.logger import (
     metrics_from_stage_a,
     metrics_from_stage_b,
 )
-from src.training.losses import deep_supervision_loss, segmentation_loss
+from src.training.losses import (
+    BCE_VARIANTS,
+    DEFAULT_BCE_VARIANT,
+    DEFAULT_FOCAL_ALPHA,
+    DEFAULT_FOCAL_GAMMA,
+    deep_supervision_loss,
+    segmentation_loss,
+)
 
 
 def resolve_device(name: str = "auto") -> torch.device:
@@ -72,6 +79,20 @@ def seed_everything(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def _cross_entropy_settings(loss: Mapping[str, Any]) -> dict[str, Any]:
+    """The optional cross-entropy keys of a stage's ``loss`` block.
+
+    All three are optional, so a config written before focal loss existed still
+    resolves - to the plain objective it was measured under.
+    """
+    alpha = loss.get("focal_alpha", DEFAULT_FOCAL_ALPHA)
+    return {
+        "bce_variant": str(loss.get("bce", DEFAULT_BCE_VARIANT)),
+        "focal_gamma": float(loss.get("focal_gamma", DEFAULT_FOCAL_GAMMA)),
+        "focal_alpha": None if alpha is None else float(alpha),
+    }
+
+
 @dataclass(frozen=True)
 class TrainingSettings:
     """Resolved training configuration for one stage on one hardware profile."""
@@ -88,6 +109,13 @@ class TrainingSettings:
     scheduler: str = "cosine"
     lambda_dice: float = 1.0
     lambda_bce: float = 1.0
+    # Cross-entropy variant for the `lambda_bce` term: "plain" or "focal".
+    # See src/training/losses.py and docs/stage_b_tuning_plan.md section 3.3.
+    # Focal is numerically much smaller than plain BCE, so switching variant
+    # without recalibrating `lambda_bce` changes the objective's balance.
+    bce_variant: str = DEFAULT_BCE_VARIANT
+    focal_gamma: float = DEFAULT_FOCAL_GAMMA
+    focal_alpha: float | None = DEFAULT_FOCAL_ALPHA
     threshold: float = 0.5
     seed: int = 20260915
     model_profile: str = "default"
@@ -134,6 +162,7 @@ class TrainingSettings:
             scheduler=str(scheduler["name"]),
             lambda_dice=float(loss["lambda_dice"]),
             lambda_bce=float(loss["lambda_bce"]),
+            **_cross_entropy_settings(loss),
             threshold=float(stage.get("threshold", 0.5)),
             seed=int(common["seed"]),
             model_profile=str(hardware.get("model_profile", "default")),
@@ -192,6 +221,7 @@ class TrainingSettings:
             scheduler=str(scheduler["name"]),
             lambda_dice=float(loss["lambda_dice"]),
             lambda_bce=float(loss["lambda_bce"]),
+            **_cross_entropy_settings(loss),
             threshold=float(stage.get("threshold", 0.5)),
             seed=int(common["seed"]),
             model_profile=str(hardware.get("model_profile", "default")),
@@ -215,6 +245,32 @@ class TrainingSettings:
             raise ValueError(
                 f"precision must be one of {self.PRECISIONS}, got {self.precision!r}"
             )
+        # Fail on a typo rather than quietly training the plain objective.
+        if self.bce_variant not in BCE_VARIANTS:
+            raise ValueError(
+                f"bce_variant must be one of {BCE_VARIANTS}, got {self.bce_variant!r}"
+            )
+        if self.focal_gamma < 0:
+            raise ValueError(f"focal_gamma must be >= 0, got {self.focal_gamma}")
+        if self.focal_alpha is not None and not 0.0 <= self.focal_alpha <= 1.0:
+            raise ValueError(
+                f"focal_alpha must lie in [0, 1] or be None, got {self.focal_alpha}"
+            )
+
+    @property
+    def loss_kwargs(self) -> dict[str, Any]:
+        """The loss-shaping arguments, as :func:`segmentation_loss` takes them.
+
+        One place to add a term, so Stage A's deep-supervision path and Stage B's
+        single-scale path can never drift apart on the objective they optimise.
+        """
+        return {
+            "lambda_dice": self.lambda_dice,
+            "lambda_bce": self.lambda_bce,
+            "bce_variant": self.bce_variant,
+            "focal_gamma": self.focal_gamma,
+            "focal_alpha": self.focal_alpha,
+        }
 
     @property
     def autocast_dtype(self) -> torch.dtype | None:
@@ -445,8 +501,7 @@ class StageATrainer:
                     output.deep_supervision,
                     batch["target_masks"],
                     self._deep_supervision_weights(),
-                    lambda_dice=self.settings.lambda_dice,
-                    lambda_bce=self.settings.lambda_bce,
+                    **self.settings.loss_kwargs,
                 )
             self.scaler.scale(loss / accumulation).backward()
             if (index + 1) % accumulation == 0:
@@ -502,8 +557,7 @@ class StageATrainer:
             loss, _ = segmentation_loss(
                 output.logits.float(),
                 batch["target_masks"],
-                lambda_dice=self.settings.lambda_dice,
-                lambda_bce=self.settings.lambda_bce,
+                **self.settings.loss_kwargs,
             )
             total_loss += float(loss)
             steps += 1
@@ -723,8 +777,7 @@ class StageBTrainer:
         return segmentation_loss(
             logits.float(),
             batch["target_mask"],
-            lambda_dice=self.settings.lambda_dice,
-            lambda_bce=self.settings.lambda_bce,
+            **self.settings.loss_kwargs,
         )
 
     # -- training ----------------------------------------------------------

@@ -26,10 +26,13 @@ from src.evaluation.metrics import (
 )
 from src.models.shape_segmenter import ShapeSegmenter
 from src.training.losses import (
+    BCE_VARIANTS,
     bce_loss,
+    cross_entropy_term,
     deep_supervision_loss,
     dice_loss,
     downsample_targets,
+    focal_bce_loss,
     segmentation_loss,
 )
 from src.training.trainer import (
@@ -72,6 +75,188 @@ def test_segmentation_loss_reports_its_components():
     assert set(parts) == {"dice", "bce"}
     assert pytest.approx(float(total), rel=1e-5) == parts["dice"] + parts["bce"]
     assert pytest.approx(parts["bce"], abs=1e-4) == float(bce_loss(torch.zeros_like(target), target))
+
+
+# ---------------------------------------------------------------------------
+# Focal cross-entropy
+#
+# The point of the focal variant is that plain BCE is diluted to ~2% of the
+# Stage B objective by a 1:552 foreground imbalance, whatever `lambda_bce` says.
+# These tests pin the two properties that make it a fix rather than a rescaling:
+# it collapses to plain BCE at gamma=0, and at gamma=2 it all but ignores easy
+# background while keeping full weight on confidently-wrong voxels.
+# ---------------------------------------------------------------------------
+def test_focal_reduces_to_plain_bce_at_gamma_zero():
+    """gamma=0 removes the focusing term; alpha=None removes the balancing one."""
+    torch.manual_seed(0)
+    logits = torch.randn(2, 1, 4, 4, 4)
+    target = (torch.rand(2, 1, 4, 4, 4) > 0.8).float()
+    focal = focal_bce_loss(logits, target, gamma=0.0, alpha=None)
+    assert float(focal) == pytest.approx(float(bce_loss(logits, target)), abs=1e-6)
+
+
+def test_focal_downweights_easy_background_but_not_confident_mistakes():
+    """The (1 - p_t)^gamma factor, at the confidences this model actually reaches."""
+    easy = torch.logit(torch.tensor([[[[[0.001]]]]]))       # predicted 0.001, true 0
+    wrong = torch.logit(torch.tensor([[[[[0.996]]]]]))      # predicted 0.996, true 0
+    background = torch.zeros(1, 1, 1, 1, 1)
+
+    easy_ratio = float(
+        focal_bce_loss(easy, background, gamma=2.0, alpha=None)
+        / bce_loss(easy, background)
+    )
+    wrong_ratio = float(
+        focal_bce_loss(wrong, background, gamma=2.0, alpha=None)
+        / bce_loss(wrong, background)
+    )
+    assert easy_ratio == pytest.approx(1e-6, rel=0.05)
+    assert wrong_ratio == pytest.approx(0.992, rel=0.01)
+    # Five orders of magnitude between them: that is the dilution being removed.
+    assert wrong_ratio / easy_ratio > 1e5
+
+
+def test_focal_is_smaller_than_plain_bce_so_it_needs_its_own_lambda():
+    """The calibration warning in the config and the docs, pinned as a test."""
+    torch.manual_seed(1)
+    logits = torch.randn(2, 1, 8, 8, 8)
+    target = (torch.rand(2, 1, 8, 8, 8) > 0.9).float()
+    assert float(focal_bce_loss(logits, target)) < float(bce_loss(logits, target))
+
+
+def test_focal_alpha_weights_the_positive_class():
+    logits = torch.zeros(1, 1, 2, 2, 2)
+    positive = torch.ones(1, 1, 2, 2, 2)
+    negative = torch.zeros(1, 1, 2, 2, 2)
+    # alpha scales positives, (1 - alpha) scales negatives.
+    assert float(focal_bce_loss(logits, positive, alpha=0.0)) == pytest.approx(0.0)
+    assert float(focal_bce_loss(logits, negative, alpha=1.0)) == pytest.approx(0.0)
+    half = float(focal_bce_loss(logits, positive, alpha=0.5))
+    full = float(focal_bce_loss(logits, positive, alpha=None))
+    assert half == pytest.approx(0.5 * full, rel=1e-5)
+
+
+def test_focal_is_finite_for_saturated_logits_and_backpropagates():
+    """A confidently-wrong voxel must give a finite loss and a real gradient."""
+    logits = torch.tensor([[[[[80.0, -80.0]]]]], requires_grad=True)
+    target = torch.tensor([[[[[0.0, 1.0]]]]])
+    loss = focal_bce_loss(logits, target)
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert torch.isfinite(logits.grad).all()
+    assert float(logits.grad.abs().sum()) > 0
+
+
+def test_focal_rejects_bad_parameters_and_shapes():
+    logits = torch.zeros(1, 1, 2, 2, 2)
+    target = torch.zeros(1, 1, 2, 2, 2)
+    with pytest.raises(ValueError, match="gamma"):
+        focal_bce_loss(logits, target, gamma=-1.0)
+    with pytest.raises(ValueError, match="alpha"):
+        focal_bce_loss(logits, target, alpha=1.5)
+    with pytest.raises(ValueError, match="shape mismatch"):
+        focal_bce_loss(logits, torch.zeros(1, 1, 2, 2, 3))
+
+
+def test_cross_entropy_term_dispatches_and_rejects_unknown_names():
+    torch.manual_seed(2)
+    logits = torch.randn(1, 1, 4, 4, 4)
+    target = (torch.rand(1, 1, 4, 4, 4) > 0.8).float()
+    assert float(cross_entropy_term(logits, target, variant="plain")) == pytest.approx(
+        float(bce_loss(logits, target))
+    )
+    assert float(cross_entropy_term(logits, target, variant="focal")) == pytest.approx(
+        float(focal_bce_loss(logits, target))
+    )
+    # A typo must not silently train the plain objective.
+    with pytest.raises(ValueError, match="bce variant"):
+        cross_entropy_term(logits, target, variant="focal_bce")
+    assert BCE_VARIANTS == ("plain", "focal")
+
+
+def test_segmentation_loss_defaults_to_plain_so_existing_runs_are_unchanged():
+    torch.manual_seed(3)
+    logits = torch.randn(2, 1, 4, 4, 4)
+    target = (torch.rand(2, 1, 4, 4, 4) > 0.8).float()
+    default_total, default_parts = segmentation_loss(logits, target)
+    plain_total, _ = segmentation_loss(logits, target, bce_variant="plain")
+    assert float(default_total) == float(plain_total)
+    assert default_parts["bce"] == pytest.approx(float(bce_loss(logits, target)))
+
+
+def test_segmentation_loss_reports_focal_under_the_same_component_key():
+    """The logged series stays comparable across variants; only the value moves."""
+    torch.manual_seed(4)
+    logits = torch.randn(2, 1, 4, 4, 4)
+    target = (torch.rand(2, 1, 4, 4, 4) > 0.8).float()
+    plain_total, plain_parts = segmentation_loss(logits, target, bce_variant="plain")
+    focal_total, focal_parts = segmentation_loss(logits, target, bce_variant="focal")
+
+    assert set(focal_parts) == set(plain_parts) == {"dice", "bce"}
+    assert focal_parts["dice"] == pytest.approx(plain_parts["dice"])
+    assert focal_parts["bce"] < plain_parts["bce"]
+    assert float(focal_total) < float(plain_total)
+
+
+def test_focal_is_computed_in_float32_whatever_the_input_dtype():
+    torch.manual_seed(5)
+    logits = torch.randn(1, 1, 4, 4, 4)
+    target = (torch.rand(1, 1, 4, 4, 4) > 0.8).float()
+    reference = float(focal_bce_loss(logits, target))
+    for dtype in (torch.float16, torch.bfloat16):
+        assert focal_bce_loss(logits.to(dtype), target).dtype == torch.float32
+        assert float(focal_bce_loss(logits.to(dtype), target)) == pytest.approx(
+            reference, rel=5e-2
+        )
+
+
+def test_deep_supervision_forwards_the_cross_entropy_variant():
+    torch.manual_seed(6)
+    target = (torch.rand(1, 1, 8, 8, 8) > 0.8).float()
+    predictions = [torch.randn(1, 1, size, size, size) for size in (2, 4, 8)]
+    plain, _ = deep_supervision_loss(predictions, target, [0.1, 0.3, 0.6])
+    focal, _ = deep_supervision_loss(
+        predictions, target, [0.1, 0.3, 0.6], bce_variant="focal"
+    )
+    assert float(focal) != float(plain)
+
+
+def test_settings_carry_the_loss_variant_and_reject_bad_values():
+    settings = TrainingSettings()
+    assert settings.bce_variant == "plain"
+    assert settings.loss_kwargs["bce_variant"] == "plain"
+    assert set(settings.loss_kwargs) == {
+        "lambda_dice", "lambda_bce", "bce_variant", "focal_gamma", "focal_alpha",
+    }
+    with pytest.raises(ValueError, match="bce_variant"):
+        TrainingSettings(bce_variant="focal_bce")
+    with pytest.raises(ValueError, match="focal_gamma"):
+        TrainingSettings(focal_gamma=-1.0)
+    with pytest.raises(ValueError, match="focal_alpha"):
+        TrainingSettings(focal_alpha=2.0)
+
+
+def test_stage_configs_resolve_the_loss_variant():
+    """A `loss` block without the focal keys still resolves, to plain BCE."""
+    for stage in ("for_stage_a", "for_stage_b"):
+        settings = getattr(TrainingSettings, stage)(hardware_profile="rtx5090")
+        assert settings.bce_variant in BCE_VARIANTS
+    legacy = TrainingSettings.for_stage_b(
+        hardware_profile="rtx5090",
+        config={
+            "common": {"seed": 1},
+            "hardware_profiles": {"rtx5090": {
+                "batch_size": 1, "gradient_accumulation_steps": 1, "precision": "fp32",
+                "num_workers": 0,
+            }},
+            "stage_b_oracle": {
+                "epochs": 1,
+                "optimizer": {"lr": 1e-3, "weight_decay": 0.0},
+                "scheduler": {"name": "cosine"},
+                "loss": {"lambda_dice": 1.0, "lambda_bce": 1.0},
+            },
+        },
+    )
+    assert legacy.bce_variant == "plain"
 
 
 def test_deep_supervision_weights_each_scale():

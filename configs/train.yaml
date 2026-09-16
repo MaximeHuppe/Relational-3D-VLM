@@ -1,7 +1,8 @@
 # Training procedure (Phases 1-4 implementation; hyperparameters fixed here).
 # Phase 0 runs no training.
 
-train_version: "1.2.0"   # 1.2.0: rotation_90 augmentation with the direction rewrite
+train_version: "1.3.0"   # 1.3.0: selectable focal cross-entropy (loss.bce)
+                         # 1.2.0: rotation_90 augmentation with the direction rewrite
 
 common:
   seed: 20260915
@@ -27,7 +28,7 @@ logging:
   backend: wandb
   wandb:
     project: relational-3d-vlm
-    tags: [relational-3d-vlm]
+    tags: [relational-3d-vlm, LR-3e-4, warmup-5, epoch-30, augmented, focal-BCE-24, gamma-2.0, alpha-0.25]
 
 hardware_profiles:
   laptop_mps:
@@ -134,13 +135,50 @@ stage_b_overfit:
 
 # Phase 3: oracle-anchor training - the primary proof-of-concept measurement.
 stage_b_oracle:
-  epochs: 100
+  epochs: 30
   optimizer: {name: adamw, lr: 0.0003, weight_decay: 0.00001}
   scheduler: {name: cosine, warmup_epochs: 5}
   loss:
-    # L = lambda_dice * DiceLoss + lambda_bce * BCEWithLogitsLoss
+    # L = lambda_dice * DiceLoss + lambda_bce * <cross-entropy term>
     lambda_dice: 1.0
-    lambda_bce: 1.0
+    lambda_bce: 24.0
+
+    # Which cross-entropy term. "plain" is BCEWithLogitsLoss, the objective
+    # stated in CLAUDE.md. "focal" is the same thing reweighted per voxel by
+    # (1 - p_t)^focal_gamma, which concentrates the gradient on voxels the model
+    # gets confidently wrong and effectively discards the easy background.
+    #
+    # Why the option exists: a Stage B target is ~474 of 262,144 voxels (0.18%,
+    # a 1:552 imbalance), so plain BCE averages to ~2% of the loss no matter how
+    # large lambda_bce is - measured at both extremes of fit, 2.1% at Dice 0.22
+    # and 0.8% at Dice 0.95. Focal fixes that structurally instead of by
+    # multiplying through a constant. See docs/stage_b_tuning_plan.md section 3.3.
+    #
+    # IMPORTANT: focal is SMALLER than plain BCE on the same logits, so it needs
+    # its own lambda - carrying the plain weight across re-creates the dilution
+    # it exists to remove. Measured on val with a real checkpoint:
+    #
+    #   dice component 0.8497 | plain bce 0.019828 | focal bce 0.008860
+    #   focal / plain = 0.447
+    #
+    #   share of the dice term:   20%    25%    50%
+    #   lambda_bce (focal):        19     24     48
+    #   lambda_bce (plain):         9     11     21
+    #
+    # lambda_bce below is 24, i.e. focal at ~25% of the Dice term. The plain
+    # column reproduces section 3.2's predicted table (11.9 predicted, 11
+    # measured), so the two calibrations agree. Re-derive with
+    # lambda_bce = f * dice_component / bce_component from the logged "bce"
+    # component after one epoch if the operating point moves.
+    bce: focal
+    # Focusing exponent; 0 reduces focal exactly to plain BCE.
+    focal_gamma: 2.0
+    # Weight on the positive class (1 - alpha weights the negative one). 0.25
+    # therefore emphasises negatives, which suits the measured error budget
+    # here - false positives outnumber false negatives 2.5 to 1. Raise it
+    # toward 0.5 if recall collapses. Omit the key, or set it to null, to
+    # disable class balancing and keep only the focusing term.
+    focal_alpha: 0.25
     # No target-shape classification loss in this milestone.
   threshold: 0.5
   # Validation targets are the two held-out classes, so this metric measures

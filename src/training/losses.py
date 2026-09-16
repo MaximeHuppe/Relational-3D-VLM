@@ -20,6 +20,13 @@ Stage B uses the objective stated in CLAUDE.md::
 
 which is :func:`segmentation_loss` with a single logit channel, at full
 resolution only - Stage B has no deep supervision.
+
+The ``BCEWithLogits`` term may optionally be replaced by its focal variant
+(``bce_variant="focal"``, see :func:`focal_bce_loss`). That is a deliberate
+departure from the objective as literally written above, motivated in
+``docs/stage_b_tuning_plan.md`` §3.3: at Stage B's 1:552 foreground imbalance the
+plain term contributes ~2% of the loss regardless of ``lambda_bce``. The default
+is ``plain``, so nothing changes unless a config asks for it.
 """
 
 from __future__ import annotations
@@ -31,6 +38,17 @@ from torch import Tensor
 from torch.nn import functional as F
 
 DEFAULT_SMOOTH = 1.0
+
+#: Cross-entropy variants `segmentation_loss` accepts. ``plain`` is the default
+#: and reproduces every run made before focal loss existed, bit for bit.
+BCE_VARIANTS: tuple[str, ...] = ("plain", "focal")
+DEFAULT_BCE_VARIANT = "plain"
+
+#: Focusing exponent. 0 reduces focal BCE exactly to plain BCE.
+DEFAULT_FOCAL_GAMMA = 2.0
+#: Weight on the POSITIVE class; ``1 - alpha`` weights the negative one.
+#: ``None`` disables the class balancing and keeps only the focusing term.
+DEFAULT_FOCAL_ALPHA: float | None = 0.25
 
 
 def _flatten_spatial(x: Tensor) -> Tensor:
@@ -78,6 +96,99 @@ def bce_loss(logits: Tensor, targets: Tensor) -> Tensor:
     return F.binary_cross_entropy_with_logits(logits, targets.to(logits.dtype))
 
 
+def focal_bce_loss(
+    logits: Tensor,
+    targets: Tensor,
+    *,
+    gamma: float = DEFAULT_FOCAL_GAMMA,
+    alpha: float | None = DEFAULT_FOCAL_ALPHA,
+) -> Tensor:
+    """Focal binary cross-entropy (Lin et al., 2017), averaged over every element.
+
+    Plain BCE weights every voxel equally, which is why it is worth so little
+    here: a Stage B target occupies ~474 of 262,144 voxels (0.18%, a 1:552
+    imbalance), so the mean is dominated by background that the model already
+    predicts correctly, and the whole term lands at ~2% of the objective however
+    large ``lambda_bce`` is set. Focal loss fixes that by construction rather
+    than by multiplying through a constant::
+
+        FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
+
+    where ``p_t`` is the probability assigned to the *correct* class. The
+    ``(1 - p_t)^gamma`` factor is what does the work - at ``gamma=2`` and the
+    confidence levels this model actually reaches:
+
+    ===========================================  =====  =============
+    voxel                                        p_t    (1 - p_t)^2
+    ===========================================  =====  =============
+    easy background (predicted 0.001, true 0)    0.999  1e-6
+    confidently-wrong FP (predicted 0.996,       0.004  0.992
+    true 0)
+    ===========================================  =====  =============
+
+    so the ~261,000 easy background voxels are effectively discarded and the
+    gradient concentrates on the mistakes.
+
+    Args:
+        logits: ``[B, C, D, H, W]`` raw logits.
+        targets: ``[B, C, D, H, W]`` binary targets in ``{0, 1}``.
+        gamma: focusing exponent, ``>= 0``. ``0`` reduces this to plain BCE
+            (modulated by ``alpha``), which is the property the tests pin.
+        alpha: weight on the positive class, in ``[0, 1]``; ``1 - alpha`` weights
+            the negative one. ``None`` disables class balancing entirely. The
+            usual default of 0.25 therefore emphasises *negatives*, which suits a
+            model whose errors are predominantly false positives; raise it toward
+            0.5 if recall collapses.
+
+    Note:
+        Focal BCE is numerically much smaller than plain BCE - everything easy is
+        down-weighted toward zero - so it needs its own ``lambda_bce``. Reusing
+        the plain-BCE weight silently recreates the dilution this exists to fix.
+        The magnitude is reported in the loss components so it can be calibrated
+        against the Dice term after one epoch.
+    """
+    if gamma < 0:
+        raise ValueError(f"gamma must be >= 0, got {gamma}")
+    if alpha is not None and not 0.0 <= alpha <= 1.0:
+        raise ValueError(f"alpha must lie in [0, 1] or be None, got {alpha}")
+    if logits.shape != targets.shape:
+        raise ValueError(
+            f"shape mismatch: logits {tuple(logits.shape)} vs targets {tuple(targets.shape)}"
+        )
+    logits = _as_loss_dtype(logits)
+    targets = targets.to(logits.dtype)
+    # `binary_cross_entropy_with_logits` is the log-sum-exp form, so a large
+    # positive logit is never exponentiated and the term stays finite.
+    bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+    probabilities = torch.sigmoid(logits)
+    p_t = probabilities * targets + (1.0 - probabilities) * (1.0 - targets)
+    loss = ((1.0 - p_t) ** gamma) * bce
+    if alpha is not None:
+        alpha_t = alpha * targets + (1.0 - alpha) * (1.0 - targets)
+        loss = alpha_t * loss
+    return loss.mean()
+
+
+def cross_entropy_term(
+    logits: Tensor,
+    targets: Tensor,
+    *,
+    variant: str = DEFAULT_BCE_VARIANT,
+    focal_gamma: float = DEFAULT_FOCAL_GAMMA,
+    focal_alpha: float | None = DEFAULT_FOCAL_ALPHA,
+) -> Tensor:
+    """Dispatch to :func:`bce_loss` or :func:`focal_bce_loss` by name.
+
+    Unknown names are rejected rather than silently falling back to plain BCE: a
+    typo in ``configs/train.yaml`` must not quietly train the wrong objective.
+    """
+    if variant not in BCE_VARIANTS:
+        raise ValueError(f"bce variant must be one of {BCE_VARIANTS}, got {variant!r}")
+    if variant == "focal":
+        return focal_bce_loss(logits, targets, gamma=focal_gamma, alpha=focal_alpha)
+    return bce_loss(logits, targets)
+
+
 def segmentation_loss(
     logits: Tensor,
     targets: Tensor,
@@ -85,13 +196,28 @@ def segmentation_loss(
     lambda_dice: float = 1.0,
     lambda_bce: float = 1.0,
     smooth: float = DEFAULT_SMOOTH,
+    bce_variant: str = DEFAULT_BCE_VARIANT,
+    focal_gamma: float = DEFAULT_FOCAL_GAMMA,
+    focal_alpha: float | None = DEFAULT_FOCAL_ALPHA,
 ) -> tuple[Tensor, dict[str, float]]:
-    """``lambda_dice * DiceLoss + lambda_bce * BCEWithLogitsLoss``.
+    """``lambda_dice * DiceLoss + lambda_bce * CrossEntropy``.
+
+    ``bce_variant`` selects the cross-entropy term: ``plain`` (the default, and
+    the objective stated in CLAUDE.md) or ``focal``. The component is reported
+    under the key ``"bce"`` either way, so the logged series stays comparable
+    across runs; which variant produced it is recorded in the run's saved
+    configuration.
 
     Returns the total and a dict of the detached components, for logging.
     """
     dice = dice_loss(logits, targets, smooth=smooth)
-    bce = bce_loss(logits, targets)
+    bce = cross_entropy_term(
+        logits,
+        targets,
+        variant=bce_variant,
+        focal_gamma=focal_gamma,
+        focal_alpha=focal_alpha,
+    )
     total = lambda_dice * dice + lambda_bce * bce
     return total, {"dice": float(dice.detach()), "bce": float(bce.detach())}
 
@@ -126,6 +252,9 @@ def deep_supervision_loss(
     lambda_dice: float = 1.0,
     lambda_bce: float = 1.0,
     smooth: float = DEFAULT_SMOOTH,
+    bce_variant: str = DEFAULT_BCE_VARIANT,
+    focal_gamma: float = DEFAULT_FOCAL_GAMMA,
+    focal_alpha: float | None = DEFAULT_FOCAL_ALPHA,
 ) -> tuple[Tensor, dict[str, float]]:
     """Weighted sum of :func:`segmentation_loss` over the deep-supervision maps.
 
@@ -147,6 +276,9 @@ def deep_supervision_loss(
             lambda_dice=lambda_dice,
             lambda_bce=lambda_bce,
             smooth=smooth,
+            bce_variant=bce_variant,
+            focal_gamma=focal_gamma,
+            focal_alpha=focal_alpha,
         )
         total = total + weight * loss
         resolution = int(prediction.shape[-1])
