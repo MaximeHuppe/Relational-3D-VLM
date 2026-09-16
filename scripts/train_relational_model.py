@@ -160,6 +160,21 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="focal weight on the positive class, in [0, 1]",
     )
     parser.add_argument(
+        "--lambda-centroid", type=float, default=None,
+        help="weight on the auxiliary centroid term pulling the mask's centre of "
+             "mass toward the target's (default: configs/train.yaml; ~2.8 is 25%% "
+             "of the Dice term)",
+    )
+    parser.add_argument(
+        "--centroid-head", action="store_true", default=None,
+        help="build the model with the bottleneck centroid-regression head; its "
+             "error is logged even at --lambda-centroid-head 0, as a probe",
+    )
+    parser.add_argument(
+        "--lambda-centroid-head", type=float, default=None,
+        help="weight on the centroid head's regression loss (needs --centroid-head)",
+    )
+    parser.add_argument(
         "--augment", dest="augment", action="store_true", default=None,
         help="rotate the training examples per epoch and rewrite their directions "
              "(default: on for --phase oracle, off for --phase overfit)",
@@ -214,6 +229,8 @@ def build_settings(args: argparse.Namespace) -> TrainingSettings:
             "lambda_bce": args.lambda_bce,
             "focal_gamma": args.focal_gamma,
             "focal_alpha": args.focal_alpha,
+            "lambda_centroid": args.lambda_centroid,
+            "lambda_centroid_head": args.lambda_centroid_head,
             "device": args.device,
             "seed": args.seed,
             "model_profile": args.model_profile,
@@ -320,6 +337,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             variant=args.variant or "full",
             input_resolution=max(train_dataset.volume_shape),
             spacing=train_dataset.spacing,
+            centroid_head=args.centroid_head,
         )
 
     anchor_provider = build_anchor_provider(
@@ -358,6 +376,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         if settings.bce_variant == "focal":
             objective += f" (gamma {settings.focal_gamma}, alpha {settings.focal_alpha})"
+        if settings.lambda_centroid:
+            objective += f" + {settings.lambda_centroid} centroid"
+        if settings.lambda_centroid_head:
+            objective += f" + {settings.lambda_centroid_head} centroid_head"
         print(objective)
         print()
 

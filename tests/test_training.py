@@ -72,7 +72,9 @@ def test_segmentation_loss_reports_its_components():
     target = torch.zeros(1, 2, 4, 4, 4)
     target[:, :, 1:3] = 1
     total, parts = segmentation_loss(torch.zeros_like(target), target, lambda_dice=1.0, lambda_bce=1.0)
-    assert set(parts) == {"dice", "bce"}
+    # `centroid` is always reported so it can be calibrated, but only enters the
+    # total when lambda_centroid > 0 - which it is not here.
+    assert set(parts) == {"dice", "bce", "centroid"}
     assert pytest.approx(float(total), rel=1e-5) == parts["dice"] + parts["bce"]
     assert pytest.approx(parts["bce"], abs=1e-4) == float(bce_loss(torch.zeros_like(target), target))
 
@@ -191,7 +193,7 @@ def test_segmentation_loss_reports_focal_under_the_same_component_key():
     plain_total, plain_parts = segmentation_loss(logits, target, bce_variant="plain")
     focal_total, focal_parts = segmentation_loss(logits, target, bce_variant="focal")
 
-    assert set(focal_parts) == set(plain_parts) == {"dice", "bce"}
+    assert set(focal_parts) == set(plain_parts) == {"dice", "bce", "centroid"}
     assert focal_parts["dice"] == pytest.approx(plain_parts["dice"])
     assert focal_parts["bce"] < plain_parts["bce"]
     assert float(focal_total) < float(plain_total)
@@ -226,6 +228,7 @@ def test_settings_carry_the_loss_variant_and_reject_bad_values():
     assert settings.loss_kwargs["bce_variant"] == "plain"
     assert set(settings.loss_kwargs) == {
         "lambda_dice", "lambda_bce", "bce_variant", "focal_gamma", "focal_alpha",
+        "lambda_centroid", "centroid_min_mass",
     }
     with pytest.raises(ValueError, match="bce_variant"):
         TrainingSettings(bce_variant="focal_bce")
@@ -268,7 +271,12 @@ def test_deep_supervision_weights_each_scale():
         torch.zeros(1, 2, 16, 16, 16),
     ]
     total, parts = deep_supervision_loss(predictions, target, [0.1, 0.3, 0.6])
-    assert {"dice@4", "bce@4", "dice@8", "bce@8", "dice@16", "bce@16", "total"} == set(parts)
+    assert {
+        "dice@4", "bce@4", "centroid@4",
+        "dice@8", "bce@8", "centroid@8",
+        "dice@16", "bce@16", "centroid@16",
+        "total",
+    } == set(parts)
     expected = sum(
         weight * (parts[f"dice@{resolution}"] + parts[f"bce@{resolution}"])
         for weight, resolution in zip([0.1, 0.3, 0.6], [4, 8, 16])

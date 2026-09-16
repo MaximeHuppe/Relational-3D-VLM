@@ -176,6 +176,152 @@ def batch_hausdorff(
     ]
 
 
+def soft_centroid(
+    weights: Tensor,
+    *,
+    spacing: Sequence[float] = (1.0, 1.0, 1.0),
+    eps: float = 1e-6,
+) -> Tensor:
+    """Mass-weighted centroid of ``[B, C, D, H, W]`` weights, in world units.
+
+    This is the single definition of "centroid of a prediction" in the project:
+    :func:`centroid_distance` reports it and
+    :func:`src.training.losses.centroid_loss` optimises it, so the metric and the
+    loss can never disagree about what they mean.
+
+    Returns ``[B, C, 3]`` ordered ``(z, y, x)`` - array order, matching the
+    volume's own axes - while ``spacing`` is ``(x, y, z)`` as everywhere else in
+    the project. Passing a binary mask gives its ordinary centroid; passing
+    probabilities gives the expected position under the prediction, which is
+    always defined and differentiable even when nothing crosses the threshold.
+
+    ``eps`` keeps the denominator finite for an all-zero map; the caller decides
+    what an empty prediction means (``centroid_distance`` returns ``nan``,
+    ``centroid_loss`` masks the sample out).
+    """
+    if weights.ndim != 5:
+        raise ValueError(f"expected [B, C, D, H, W] weights, got {tuple(weights.shape)}")
+    batch, channels, depth, height, width = weights.shape
+    values = weights.to(torch.float32)
+    sx, sy, sz = (float(v) for v in spacing)
+    axes = (
+        torch.arange(depth, device=values.device, dtype=values.dtype) * sz,
+        torch.arange(height, device=values.device, dtype=values.dtype) * sy,
+        torch.arange(width, device=values.device, dtype=values.dtype) * sx,
+    )
+    flat = values.reshape(batch * channels, -1)
+    mass = flat.sum(dim=1, keepdim=True)
+    coordinates = torch.stack(
+        torch.meshgrid(*axes, indexing="ij")
+    ).reshape(3, -1)                                   # [3, D*H*W], ordered (z, y, x)
+    centroid = (flat @ coordinates.T) / (mass + eps)   # [B*C, 3]
+    return centroid.reshape(batch, channels, 3)
+
+
+def volume_diagonal(
+    volume_shape: Sequence[int], spacing: Sequence[float] = (1.0, 1.0, 1.0)
+) -> float:
+    """Longest distance in a ``(D, H, W)`` volume, the natural scale for an error."""
+    depth, height, width = (int(v) for v in volume_shape)
+    sx, sy, sz = (float(v) for v in spacing)
+    return math.sqrt(
+        ((depth - 1) * sz) ** 2 + ((height - 1) * sy) ** 2 + ((width - 1) * sx) ** 2
+    )
+
+
+def centroid_distance(
+    prediction: Tensor,
+    target: Tensor,
+    *,
+    threshold: float = 0.5,
+    from_logits: bool = False,
+    spacing: Sequence[float] = (1.0, 1.0, 1.0),
+    soft: bool = True,
+) -> list[float]:
+    """Per-sample distance between predicted and target centroids, in world units.
+
+    Dice conflates *looking in the wrong place* with *looking in the right place
+    at the wrong size*; this separates them. It is the metric that shows whether
+    the relational part of the task is being solved at all, which matters here
+    because the target shape is never an input - Stage B's whole job is to find
+    the right region.
+
+    Args:
+        soft: weight by probability (the default). Always defined, so no
+            empty-prediction special case, and it uses the full confidence map
+            instead of discarding it at a threshold. ``soft=False`` thresholds
+            first and returns ``nan`` for an empty prediction, which
+            :class:`MetricAccumulator` drops exactly as it drops an undefined
+            Hausdorff distance.
+
+    A large soft-vs-hard divergence is itself a signal: it means the probability
+    mass is spread or multi-modal rather than sitting on one coherent blob.
+    """
+    if prediction.shape[1] != 1:
+        raise ValueError(f"expected a single output channel, got {prediction.shape[1]}")
+    if prediction.shape != target.shape:
+        raise ValueError(
+            f"shape mismatch: prediction {tuple(prediction.shape)} vs target "
+            f"{tuple(target.shape)}"
+        )
+    scores = prediction.to(torch.float32)
+    if from_logits:
+        scores = torch.sigmoid(scores)
+    weights = scores if soft else _binarize(scores, threshold).to(torch.float32)
+    reference = _binarize(target, 0.5).to(torch.float32)
+
+    predicted = soft_centroid(weights, spacing=spacing)[:, 0]
+    expected = soft_centroid(reference, spacing=spacing)[:, 0]
+    distances = torch.linalg.vector_norm(predicted - expected, dim=1)
+
+    predicted_mass = weights.reshape(weights.shape[0], -1).sum(dim=1)
+    target_mass = reference.reshape(reference.shape[0], -1).sum(dim=1)
+    undefined = (predicted_mass <= 0) | (target_mass <= 0)
+    return [
+        float("nan") if bad else float(value)
+        for value, bad in zip(distances.tolist(), undefined.tolist())
+    ]
+
+
+def centroid_baselines(
+    target: Tensor,
+    *,
+    anchor_union: Tensor | None = None,
+    spacing: Sequence[float] = (1.0, 1.0, 1.0),
+) -> dict[str, list[float]]:
+    """Reference centroid errors, without which the model's number means nothing.
+
+    ``volume_centre`` is what a model that learned nothing scores.
+    ``anchor_union`` is what a model that ignores the *directions* and simply
+    points at the anchors scores - beating it is the minimum evidence that the
+    prompt is being used at all, and a model sitting at it is a relational
+    failure however good its Dice looks.
+
+    Neither changes during training, so they are computed from the batch itself
+    rather than being carried around as constants.
+    """
+    reference = _binarize(target, 0.5).to(torch.float32)
+    expected = soft_centroid(reference, spacing=spacing)[:, 0]
+
+    depth, height, width = target.shape[2:]
+    sx, sy, sz = (float(v) for v in spacing)
+    centre = torch.tensor(
+        [((depth - 1) / 2) * sz, ((height - 1) / 2) * sy, ((width - 1) / 2) * sx],
+        device=expected.device,
+        dtype=expected.dtype,
+    )
+    out = {
+        "volume_centre": torch.linalg.vector_norm(
+            centre.unsqueeze(0) - expected, dim=1
+        ).tolist()
+    }
+    if anchor_union is not None:
+        union = _binarize(anchor_union, 0.5).to(torch.float32)
+        anchors = soft_centroid(union, spacing=spacing)[:, 0]
+        out["anchor_union"] = torch.linalg.vector_norm(anchors - expected, dim=1).tolist()
+    return out
+
+
 @dataclass
 class PerClassMetrics:
     """Accumulates per-class Dice and IoU across batches."""
@@ -260,12 +406,21 @@ class MetricAccumulator:
     dice: list[float] = field(default_factory=list)
     iou: list[float] = field(default_factory=list)
     hausdorff: list[float] = field(default_factory=list)
+    centroid: list[float] = field(default_factory=list)
 
-    def add(self, dice: float, iou: float, hausdorff: float | None = None) -> None:
+    def add(
+        self,
+        dice: float,
+        iou: float,
+        hausdorff: float | None = None,
+        centroid: float | None = None,
+    ) -> None:
         self.dice.append(float(dice))
         self.iou.append(float(iou))
         if hausdorff is not None:
             self.hausdorff.append(float(hausdorff))
+        if centroid is not None:
+            self.centroid.append(float(centroid))
 
     def summary(self) -> dict[str, float]:
         finite = [value for value in self.hausdorff if not math.isnan(value)]
@@ -277,6 +432,10 @@ class MetricAccumulator:
         if self.hausdorff:
             result["hausdorff"] = sum(finite) / len(finite) if finite else float("nan")
             result["hausdorff_undefined"] = float(len(self.hausdorff) - len(finite))
+        if self.centroid:
+            defined = [value for value in self.centroid if not math.isnan(value)]
+            result["centroid"] = sum(defined) / len(defined) if defined else float("nan")
+            result["centroid_undefined"] = float(len(self.centroid) - len(defined))
         return result
 
 
@@ -296,6 +455,13 @@ class StratifiedMetrics:
     strata: dict[str, dict[str, MetricAccumulator]] = field(
         default_factory=lambda: defaultdict(lambda: defaultdict(MetricAccumulator))
     )
+    #: Centroid errors of the two trivial predictors, accumulated alongside the
+    #: model's own. Reported once at the top level rather than per stratum: they
+    #: do not change during training, and the model's centroid error is
+    #: uninterpretable without them.
+    centroid_baselines: dict[str, list[float]] = field(
+        default_factory=lambda: defaultdict(list)
+    )
 
     def update(
         self,
@@ -310,8 +476,16 @@ class StratifiedMetrics:
         with_hausdorff: bool = False,
         percentile: float | None = None,
         spacing: Sequence[float] = (1.0, 1.0, 1.0),
+        with_centroid: bool = True,
+        anchor_union: Tensor | None = None,
     ) -> None:
-        """Accumulate one batch of ``[B, 1, D, H, W]`` predictions."""
+        """Accumulate one batch of ``[B, 1, D, H, W]`` predictions.
+
+        ``with_centroid`` is on by default - unlike Hausdorff it costs one
+        weighted sum per sample, and it is the only number here that separates a
+        misplaced prediction from a badly-sized one. Pass ``anchor_union`` to
+        also accumulate the baselines that make it interpretable.
+        """
         dice = dice_score(prediction, target, threshold=threshold, from_logits=from_logits)
         iou = iou_score(prediction, target, threshold=threshold, from_logits=from_logits)
         distances: list[float] | list[None]
@@ -327,36 +501,71 @@ class StratifiedMetrics:
         else:
             distances = [None] * prediction.shape[0]  # type: ignore[assignment]
 
+        centroids: list[float] | list[None]
+        if with_centroid:
+            centroids = centroid_distance(
+                prediction, target, threshold=threshold, from_logits=from_logits,
+                spacing=spacing, soft=True,
+            )
+            for name, values in centroid_baselines(
+                target, anchor_union=anchor_union, spacing=spacing
+            ).items():
+                self.centroid_baselines[name].extend(values)
+        else:
+            centroids = [None] * prediction.shape[0]  # type: ignore[assignment]
+
         for index in range(prediction.shape[0]):
             sample_dice = float(dice[index].mean())
             sample_iou = float(iou[index].mean())
             distance = distances[index]
-            self.overall.add(sample_dice, sample_iou, distance)
+            centroid = centroids[index]
+            self.overall.add(sample_dice, sample_iou, distance, centroid)
             if target_shapes is not None:
-                self._add("target_shape", target_shapes[index], sample_dice, sample_iou, distance)
+                self._add(
+                    "target_shape", target_shapes[index], sample_dice, sample_iou,
+                    distance, centroid,
+                )
             if anchor_shapes is not None:
                 for name in anchor_shapes[index]:
-                    self._add("anchor_shape", name, sample_dice, sample_iou, distance)
+                    self._add(
+                        "anchor_shape", name, sample_dice, sample_iou, distance, centroid
+                    )
             if directions is not None:
                 for slot, direction in enumerate(directions[index]):
-                    self._add("direction", direction, sample_dice, sample_iou, distance)
                     self._add(
-                        "clause_slot", f"slot_{slot + 1}", sample_dice, sample_iou, distance
+                        "direction", direction, sample_dice, sample_iou, distance, centroid
+                    )
+                    self._add(
+                        "clause_slot", f"slot_{slot + 1}", sample_dice, sample_iou,
+                        distance, centroid,
                     )
 
     def _add(
-        self, stratum: str, key: str, dice: float, iou: float, hausdorff: float | None
+        self,
+        stratum: str,
+        key: str,
+        dice: float,
+        iou: float,
+        hausdorff: float | None,
+        centroid: float | None = None,
     ) -> None:
-        self.strata[stratum][key].add(dice, iou, hausdorff)
+        self.strata[stratum][key].add(dice, iou, hausdorff, centroid)
 
     def summary(self) -> dict[str, Any]:
-        return {
+        result: dict[str, Any] = {
             "overall": self.overall.summary(),
             "strata": {
                 stratum: {key: acc.summary() for key, acc in sorted(buckets.items())}
                 for stratum, buckets in sorted(self.strata.items())
             },
         }
+        if self.centroid_baselines:
+            result["centroid_baselines"] = {
+                name: sum(values) / len(values)
+                for name, values in sorted(self.centroid_baselines.items())
+                if values
+            }
+        return result
 
 
 def format_stratified_table(
@@ -365,17 +574,26 @@ def format_stratified_table(
     """Render the Stage B report for the console."""
     summary = metrics.summary() if isinstance(metrics, StratifiedMetrics) else dict(metrics)
     overall = summary["overall"]
-    lines = [f"  {'stratum':<22} {'dice':>7} {'iou':>7} {'hd':>7} {'n':>5}"]
+    lines = [
+        f"  {'stratum':<22} {'dice':>7} {'iou':>7} {'hd':>7} {'cdist':>7} {'n':>5}"
+    ]
 
     def row(label: str, entry: Mapping[str, float]) -> str:
         distance = entry.get("hausdorff")
         rendered = "      -" if distance is None else f"{distance:>7.2f}"
+        centroid = entry.get("centroid")
+        centroid_rendered = "      -" if centroid is None else f"{centroid:>7.2f}"
         return (
             f"  {label:<22} {entry['dice']:>7.4f} {entry['iou']:>7.4f} "
-            f"{rendered} {int(entry['count']):>5}"
+            f"{rendered} {centroid_rendered} {int(entry['count']):>5}"
         )
 
     lines.append(row("overall", overall))
+    baselines = summary.get("centroid_baselines") or {}
+    if baselines:
+        # Without these the centroid column is a number with no scale.
+        rendered = "  ".join(f"{name} {value:.2f}" for name, value in baselines.items())
+        lines.append(f"  {'cdist baselines':<22} {rendered}")
     for stratum, buckets in summary.get("strata", {}).items():
         if strata is not None and stratum not in strata:
             continue

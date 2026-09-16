@@ -648,6 +648,59 @@ delta component - a genuinely different rule. "Does medial/lateral localize
 worse?" is a real, testable hypothesis, and `val_strata.direction` already exists
 to answer it.
 
+### 4.5b RESULT: placement is stuck while extent is being fixed
+
+Measured with the standalone probe of §4.6 on the **same 32 validation
+examples** for every checkpoint, so the columns are directly comparable
+(the Dice column is that 32-example subset, not the logged 100-example
+`val_dice`):
+
+| checkpoint                       | dice   | **soft centroid** | precision | recall | pred/GT volume |
+| -------------------------------- | ------ | ----------------- | --------- | ------ | -------------- |
+| baseline `lambda_bce=1` (ep 64)  | -      | **7.72**          | 0.165     | 0.294  | 2.05x          |
+| `lr 1e-3` FAILED (ep 30)         | 0.2039 | **7.93**          | 0.160     | 0.295  | 2.10x          |
+| `lambda_bce=10` (best, ep 20)    | 0.1947 | **7.86**          | 0.200     | 0.232  | **1.31x**      |
+| `lambda_bce=10` (last, ep 30)    | 0.1884 | **7.93**          | 0.171     | 0.222  | 1.35x          |
+
+| baseline              | value     |
+| --------------------- | --------- |
+| anchor-union centroid | 18.79 vox |
+| volume centre         | 26.78 vox |
+
+**The centroid error has not moved. At all.** 7.72 -> 7.93 across three
+objectives and ~45 epochs of training, while over the same span the BCE
+reweighting did exactly what §3.2 predicted for *extent*: the predicted/GT
+volume ratio fell **2.05x -> 1.31x** and precision rose 0.165 -> 0.200 (with
+recall falling 0.294 -> 0.232, the trade-off §3.2 warned to watch).
+
+Against §4.5's decision table this is unambiguously the third row - *extent
+improving, placement stuck* - which is the case where §5 earns its place.
+
+Two further readings:
+
+* the model is **well clear of the trivial predictors** (7.9 against 18.8 for
+  anchor-union), so the prompt *is* being used; this is not a relational
+  failure, it is a precision-of-placement failure. 7.9 vox is ~1.65 object radii;
+* **`medial` is the worst direction token in every single arm** (9.1-9.8 vox,
+  against 6.8-7.4 for `lateral`, the best), with `anterior` consistently second
+  worst. The attribution is example-level - an example's error is credited to
+  each of its three tokens - so the claim is "examples containing a medial clause
+  localise ~1.5-2 vox worse", not that the clause itself is misparsed. It is
+  reproducible across three independent checkpoints and is the first concrete
+  lead on *which* relations the model handles badly.
+
+### 4.5c IMPLEMENTED
+
+`soft_centroid`, `volume_diagonal`, `centroid_distance` and `centroid_baselines`
+are in `src/evaluation/metrics.py`; `MetricAccumulator` and `StratifiedMetrics`
+carry the centroid exactly as they carry Hausdorff, so **the stratification by
+target shape, anchor shape, direction and clause slot came for free**. It is on
+by default (`with_centroid=True`) - unlike Hausdorff it costs one weighted sum.
+
+`format_stratified_table` gains a `cdist` column and prints the baselines under
+the overall row. The per-epoch line and `metrics.jsonl` gain `val_centroid` and
+`val_centroid_baselines`.
+
 ### 4.6 Standalone diagnostic
 
 The measurements in §0 came from a script of this shape; keep it as a reusable
@@ -813,6 +866,30 @@ so it is **off by default** and every existing run stays bit-identical, and add
 `"centroid"` to the returned components dict so it is logged from the first epoch
 and can be calibrated per §5.3.
 
+### 5.4b IMPLEMENTED
+
+`centroid_loss` is in `src/training/losses.py` and reuses
+`src.evaluation.metrics.soft_centroid`, so the number reported and the number
+optimised are the same function by construction. It is wired into
+`segmentation_loss` behind `lambda_centroid` (default **0.0**), and its magnitude
+is **reported unconditionally** so the weight can be calibrated from a run that
+did not use it - the mistake `lambda_bce: 1.0` made is easy to repeat.
+
+```yaml
+# configs/train.yaml -> stage_b_oracle.loss
+lambda_centroid: 2.8       # ~25% of the Dice term at the measured 7.9 vox error
+centroid_min_mass: 10.0
+```
+
+One caveat found while implementing, now documented in the docstring and pinned
+by a test: the soft centroid weights *every* voxel, so a uniform background
+probability carries real mass at this imbalance. On a 512-voxel target the loss
+of a **perfect** prediction is 0.071 at logit magnitude 6, 0.0004 at 12 and 0.0
+at 20. The floor is an additive offset - it does not change the gradient
+direction - and the trained checkpoints already sit in the sharp regime (soft and
+hard centroids agree to 0.1 vox). Worth knowing before reading the logged
+component.
+
 ### 5.5 A cleaner alternative: an auxiliary centroid-regression head
 
 Rather than bending the segmentation map's centre of mass, predict the centroid
@@ -832,6 +909,26 @@ output you actually care about.
 Given the §0 finding that localization is *already* substantially learned, the
 regression head is the lower-risk of the two, and the one I would reach for if
 §3 fixes the extent problem but placement stays stuck around 7-8 vox.
+
+### 5.5b IMPLEMENTED
+
+The head is `RelationalVLMConfig.centroid_head` (default **false**, so a built
+model stays parameter-identical to every existing checkpoint). Implementation
+note: it is **not** the global-average-pool-then-MLP sketched in §5.5, because
+pooling destroys exactly the position information the head exists to recover. It
+is a **spatial soft-argmax**: one 1x1x1 convolution to a single channel, softmax
+over the bottleneck's 8^3 positions, and the expectation of that distribution.
+That is position-aware, differentiable, interpretable as a heatmap, gives
+sub-cell precision, and costs `bottleneck_channels + 1` parameters - 33 at the
+smoke width, 257 at the default one.
+
+`RelationalVLMOutput.centroid` is `[B, 3]` in full-resolution world units,
+ordered `(z, y, x)`; a test pins that bottleneck cell `i` maps to
+`i * scale + (scale - 1) / 2`. `centroid_head_loss` supervises it with a
+diagonal-normalised smooth-L1, weighted by `lambda_centroid_head` (default 0).
+`StageBTrainer._loss` now takes the whole model output rather than the logits,
+and **reports the head's error whenever the head exists, even at weight 0** -
+which is the configuration that makes it a probe rather than a regulariser.
 
 ### 5.6 Sequencing - the point to hold onto
 
@@ -883,8 +980,8 @@ been changed.
 | 4   | BCE weight                  | `lambda_bce: 1.0` -> `10.0`               | 2 h/run         | BCE is 2.1% of the loss, not 50%                |
 | 5   | Focal BCE (alt.)            | `gamma=2, alpha=0.25`, recalibrate lambda | 2 h/run         | targets the confidently-wrong FPs structurally  |
 | 6   | `pos_weight`                | **not now**                               | -               | pushes toward *more* volume; already 2.05x over |
-| 7   | Centroid metric             | soft + hard, with both baselines          | ~1 h to write   | separates "wrong place" from "wrong extent"     |
-| 8   | Centroid loss               | `lambda_cent ~ 3` (diag-normalized)       | after 1-4       | only if placement stalls once extent is fixed   |
+| 7   | Centroid metric             | on by default, stratified, with baselines | **done**        | **it is what found §4.5b**; extent moved, placement did not |
+| 8   | Centroid loss + head        | `lambda_centroid: 2.8`; head off by default | **done**      | §4.5b is the "placement stalls" case that justifies both |
 | 9   | More scenes                 | **no**                                    | -               | zero train/val gap                              |
 | 10  | More augmentation / repeats | **no**                                    | -               | regularizing an underfitting model              |
 

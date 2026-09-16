@@ -37,6 +37,11 @@ import torch
 from torch import Tensor
 from torch.nn import functional as F
 
+# The centroid geometry lives in the metrics module so the reported number and
+# the optimised one are the same function. `src.training` already depends on
+# `src.evaluation`, so this adds no new edge to the import graph.
+from src.evaluation.metrics import soft_centroid, volume_diagonal
+
 DEFAULT_SMOOTH = 1.0
 
 #: Cross-entropy variants `segmentation_loss` accepts. ``plain`` is the default
@@ -49,6 +54,14 @@ DEFAULT_FOCAL_GAMMA = 2.0
 #: Weight on the POSITIVE class; ``1 - alpha`` weights the negative one.
 #: ``None`` disables the class balancing and keeps only the focusing term.
 DEFAULT_FOCAL_ALPHA: float | None = 0.25
+
+#: Centroid term off by default: it is auxiliary, and a run that does not ask
+#: for it must be unchanged.
+DEFAULT_LAMBDA_CENTROID = 0.0
+#: Predicted foreground mass, in voxels, below which the centroid term is
+#: silenced for that sample. Early in training the total mass is near zero and
+#: the centroid of nothing is meaningless.
+DEFAULT_CENTROID_MIN_MASS = 10.0
 
 
 def _flatten_spatial(x: Tensor) -> Tensor:
@@ -189,6 +202,119 @@ def cross_entropy_term(
     return bce_loss(logits, targets)
 
 
+def centroid_loss(
+    logits: Tensor,
+    targets: Tensor,
+    *,
+    spacing: Sequence[float] = (1.0, 1.0, 1.0),
+    min_mass: float = DEFAULT_CENTROID_MIN_MASS,
+) -> Tensor:
+    """Distance between the predicted and target centroids, as a fraction of the
+    volume diagonal.
+
+    Why this exists alongside Dice: **soft Dice has a vanishing gradient when the
+    prediction and the target do not overlap.** The numerator ``sum(p * g)`` is
+    ~0 and stays ~0 under small perturbations, so the loss says *that* the
+    prediction is wrong while carrying almost no information about *which way to
+    move it*. At Stage B's 1:552 foreground imbalance that regime is common. The
+    centroid term has no such dead zone: differentiating through
+    :func:`~src.evaluation.metrics.soft_centroid` raises ``p`` for voxels on the
+    target's side of the current predicted centroid and lowers it on the far
+    side, at any separation. Same rationale as the distance-based segmentation
+    losses (Kervadec et al., *Boundary loss for highly unbalanced segmentation*).
+
+    It is **auxiliary and must never be the only term.** A centroid is invariant
+    to scale and shape: a uniform prediction over the whole volume has its
+    centroid exactly at the volume centre, and one correctly-placed voxel scores
+    perfectly. It is also gameable by bimodality - the expected centroid of two
+    symmetric false blobs sits between them, in empty space. Dice has to stay
+    dominant to punish both.
+
+    Normalising by the diagonal makes the value ~0.07 at the error this project
+    actually has, which is what ``lambda_centroid`` is calibrated against; see
+    ``docs/stage_b_tuning_plan.md`` §5.3.
+
+    Note:
+        The soft centroid weights *every* voxel, so a small uniform background
+        probability carries real mass at this imbalance: at ``p_bg = 2.5e-3``
+        over 64^3 the background outweighs a 512-voxel target. The term
+        therefore has a non-zero floor while the model is unconfident, which
+        decays as it sharpens - measured on a 512-voxel target, the loss of a
+        *perfect* prediction falls 0.071 -> 0.0004 -> 0.0 as the logit magnitude
+        goes 6 -> 12 -> 20, and the trained checkpoints already sit in the sharp
+        regime (soft and hard centroids agree to 0.1 vox). The floor is an
+        additive offset, so it does not change the gradient direction: mass is
+        still pulled toward the target and pushed away from the far side.
+
+    Args:
+        min_mass: samples whose predicted mass is below this are silenced rather
+            than contributing a centroid computed from almost nothing. They
+            contribute 0, so the term fades in as the model starts predicting.
+    """
+    if logits.shape != targets.shape:
+        raise ValueError(
+            f"shape mismatch: logits {tuple(logits.shape)} vs targets {tuple(targets.shape)}"
+        )
+    logits = _as_loss_dtype(logits)
+    probabilities = torch.sigmoid(logits)
+    reference = targets.to(probabilities.dtype)
+
+    predicted = soft_centroid(probabilities, spacing=spacing)      # [B, C, 3]
+    expected = soft_centroid(reference, spacing=spacing)
+    diagonal = volume_diagonal(logits.shape[2:], spacing)
+    distance = torch.linalg.vector_norm(predicted - expected, dim=-1) / diagonal
+
+    mass = probabilities.flatten(2).sum(dim=-1)                    # [B, C]
+    target_mass = reference.flatten(2).sum(dim=-1)
+    usable = ((mass > min_mass) & (target_mass > 0)).to(distance.dtype)
+    return (distance * usable).mean()
+
+
+def centroid_head_loss(
+    predicted_centroid: Tensor,
+    targets: Tensor,
+    *,
+    spacing: Sequence[float] = (1.0, 1.0, 1.0),
+    beta: float = 0.05,
+) -> Tensor:
+    """Smooth-L1 between the head's predicted centroid and the target's own.
+
+    The companion to :func:`centroid_loss`, and the safer of the two. Because it
+    supervises a dedicated output rather than the mask's centre of mass, it
+    cannot be satisfied by shifting probability mass around the volume - there is
+    no bimodality to exploit and no interaction with the predicted extent. What
+    it does instead is give the encoder an explicit localisation objective and,
+    read at inference, a localisation estimate independent of the decoder.
+
+    Args:
+        predicted_centroid: ``[B, 3]`` in world units, ordered ``(z, y, x)`` -
+            what :meth:`RelationalVLM.predict_centroid` returns.
+        targets: ``[B, 1, D, H, W]`` binary target masks.
+        beta: smooth-L1 transition, in units of the normalised distance. The
+            default of 0.05 is ~5.5 voxels on a 64^3 grid, so ordinary errors sit
+            in the quadratic region and only gross ones are treated linearly.
+    """
+    if predicted_centroid.ndim != 2 or predicted_centroid.shape[1] != 3:
+        raise ValueError(
+            f"expected [B, 3] predicted centroids, got {tuple(predicted_centroid.shape)}"
+        )
+    if targets.shape[0] != predicted_centroid.shape[0]:
+        raise ValueError(
+            f"batch mismatch: centroid {predicted_centroid.shape[0]} vs targets "
+            f"{targets.shape[0]}"
+        )
+    predicted = _as_loss_dtype(predicted_centroid)
+    reference = targets.to(predicted.dtype)
+    expected = soft_centroid(reference, spacing=spacing)[:, 0]
+    diagonal = volume_diagonal(targets.shape[2:], spacing)
+
+    present = (reference.flatten(1).sum(dim=1) > 0).to(predicted.dtype)
+    per_sample = F.smooth_l1_loss(
+        predicted / diagonal, expected / diagonal, beta=beta, reduction="none"
+    ).sum(dim=1)
+    return (per_sample * present).mean()
+
+
 def segmentation_loss(
     logits: Tensor,
     targets: Tensor,
@@ -199,14 +325,21 @@ def segmentation_loss(
     bce_variant: str = DEFAULT_BCE_VARIANT,
     focal_gamma: float = DEFAULT_FOCAL_GAMMA,
     focal_alpha: float | None = DEFAULT_FOCAL_ALPHA,
+    lambda_centroid: float = DEFAULT_LAMBDA_CENTROID,
+    spacing: Sequence[float] = (1.0, 1.0, 1.0),
+    centroid_min_mass: float = DEFAULT_CENTROID_MIN_MASS,
 ) -> tuple[Tensor, dict[str, float]]:
-    """``lambda_dice * DiceLoss + lambda_bce * CrossEntropy``.
+    """``lambda_dice * Dice + lambda_bce * CrossEntropy + lambda_centroid * Centroid``.
 
     ``bce_variant`` selects the cross-entropy term: ``plain`` (the default, and
     the objective stated in CLAUDE.md) or ``focal``. The component is reported
     under the key ``"bce"`` either way, so the logged series stays comparable
     across runs; which variant produced it is recorded in the run's saved
     configuration.
+
+    The centroid component is **always reported** and only added to the total
+    when ``lambda_centroid > 0``, so its magnitude can be read off a normal run
+    and used to calibrate the weight before switching it on.
 
     Returns the total and a dict of the detached components, for logging.
     """
@@ -218,8 +351,17 @@ def segmentation_loss(
         focal_gamma=focal_gamma,
         focal_alpha=focal_alpha,
     )
+    centroid = centroid_loss(
+        logits, targets, spacing=spacing, min_mass=centroid_min_mass
+    )
     total = lambda_dice * dice + lambda_bce * bce
-    return total, {"dice": float(dice.detach()), "bce": float(bce.detach())}
+    if lambda_centroid:
+        total = total + lambda_centroid * centroid
+    return total, {
+        "dice": float(dice.detach()),
+        "bce": float(bce.detach()),
+        "centroid": float(centroid.detach()),
+    }
 
 
 def downsample_targets(targets: Tensor, size: Sequence[int]) -> Tensor:
@@ -255,6 +397,9 @@ def deep_supervision_loss(
     bce_variant: str = DEFAULT_BCE_VARIANT,
     focal_gamma: float = DEFAULT_FOCAL_GAMMA,
     focal_alpha: float | None = DEFAULT_FOCAL_ALPHA,
+    lambda_centroid: float = DEFAULT_LAMBDA_CENTROID,
+    spacing: Sequence[float] = (1.0, 1.0, 1.0),
+    centroid_min_mass: float = DEFAULT_CENTROID_MIN_MASS,
 ) -> tuple[Tensor, dict[str, float]]:
     """Weighted sum of :func:`segmentation_loss` over the deep-supervision maps.
 
@@ -279,10 +424,19 @@ def deep_supervision_loss(
             bce_variant=bce_variant,
             focal_gamma=focal_gamma,
             focal_alpha=focal_alpha,
+            lambda_centroid=lambda_centroid,
+            # Each scale keeps the full-resolution world extent, so the centroid
+            # distance stays comparable across them.
+            spacing=tuple(
+                float(v) * full / int(size)
+                for v, full, size in zip(spacing, targets.shape[2:][::-1], prediction.shape[2:][::-1])
+            ),
+            centroid_min_mass=centroid_min_mass,
         )
         total = total + weight * loss
         resolution = int(prediction.shape[-1])
         components[f"dice@{resolution}"] = parts["dice"]
         components[f"bce@{resolution}"] = parts["bce"]
+        components[f"centroid@{resolution}"] = parts["centroid"]
     components["total"] = float(total.detach())
     return total, components

@@ -179,6 +179,34 @@ stage_b_oracle:
     # toward 0.5 if recall collapses. Omit the key, or set it to null, to
     # disable class balancing and keep only the focusing term.
     focal_alpha: 0.25
+
+    # Auxiliary centroid terms. Both default to 0, and BOTH magnitudes are
+    # logged regardless, so a weight can be calibrated from a run that did not
+    # use them - the same mistake `lambda_bce: 1.0` made is easy to repeat here.
+    #
+    # `lambda_centroid` pulls the MASK's centre of mass toward the target's.
+    # It fills soft Dice's blind spot: with no overlap, Dice says the prediction
+    # is wrong but not which way to move it, while this term gives a direction
+    # at any separation. Measured error is 7.9 vox = 0.072 of the volume
+    # diagonal, against a Dice component of ~0.79, so:
+    #
+    #   share of the dice term:   10%    25%    50%
+    #   lambda_centroid:          1.1    2.8    5.5
+    #
+    # It is auxiliary and must stay secondary: a centroid is invariant to scale
+    # and shape, so alone it is degenerate, and the cheapest way to move one is
+    # to ADD mass on one side - which can undo the over-prediction fix that
+    # lambda_bce just bought. Watch the predicted/GT volume ratio when enabling.
+    lambda_centroid: 0.0
+    # Predicted foreground mass, in voxels, below which the term is silenced.
+    centroid_min_mass: 10.0
+
+    # `lambda_centroid_head` weights the model's centroid-regression head
+    # (requires `stage_b.centroid_head: true` in configs/model.yaml). It
+    # supervises a dedicated output instead of bending the mask, so it cannot be
+    # gamed by bimodal mass and does not interact with the predicted extent.
+    # Leave at 0 to use the head purely as a probe - its error is still logged.
+    lambda_centroid_head: 0.0
     # No target-shape classification loss in this milestone.
   threshold: 0.5
   # Validation targets are the two held-out classes, so this metric measures

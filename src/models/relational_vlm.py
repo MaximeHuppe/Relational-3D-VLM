@@ -52,6 +52,10 @@ from src.config import load_config
 from src.data.primitives import SHAPE_NAMES
 from src.data.prompt_generator import NUM_CLAUSES
 from src.data.schema import STAGE_B_FORBIDDEN_FIELDS  # noqa: F401  (contract reference)
+# One definition of "centroid of a weight map", shared by the head, the loss
+# and the metric. `src.evaluation.metrics` imports nothing from `src`, so this
+# adds no cycle.
+from src.evaluation.metrics import soft_centroid
 from src.models.cross_modal_fusion import CrossModalFusion
 from src.models.decoder import RelationalDecoder
 from src.models.intersection_fusion import IntersectionFusion
@@ -107,6 +111,15 @@ class RelationalVLMConfig:
     slot_embedding: bool = True
     shape_embedding: bool = True
     spacing: tuple[float, float, float] = (1.0, 1.0, 1.0)
+    # Auxiliary centroid-regression head on the bottleneck (off by default, so a
+    # model built without it is parameter-identical to every earlier checkpoint).
+    # It reads WHERE the target is straight out of the conditioned bottleneck,
+    # independently of the decoder. Two uses: it gives the encoder an explicit,
+    # dense localisation signal that cannot be gamed by bimodal mass the way a
+    # centroid term on the mask can, and it is a probe - if the head localises
+    # well while the mask's own centroid does not, the encoder knows where the
+    # target is and the decoder is failing to put it there.
+    centroid_head: bool = False
     binary_threshold: float = 0.5
     bias_init: str = "prior"
     prior_foreground_fraction: float = 0.0016
@@ -201,6 +214,7 @@ class RelationalVLMConfig:
         variant: str = "full",
         input_resolution: int | None = None,
         spacing: Sequence[float] | None = None,
+        centroid_head: bool | None = None,
     ) -> "RelationalVLMConfig":
         """Build from ``configs/model.yaml``; ``profile='smoke'`` applies the overrides."""
         model_config = dict(config or load_config("model"))
@@ -230,6 +244,11 @@ class RelationalVLMConfig:
             pair_embedding=bool(prompt["pair_embedding"]),
             slot_embedding=bool(structure["slot_embedding"]),
             shape_embedding=bool(structure["shape_embedding"]),
+            centroid_head=(
+                bool(stage.get("centroid_head", False))
+                if centroid_head is None
+                else bool(centroid_head)
+            ),
             binary_threshold=float(stage["output"]["binary_threshold"]),
             bias_init=str(stage["output"].get("bias_init", "prior")),
             prior_foreground_fraction=float(
@@ -246,6 +265,9 @@ class RelationalVLMOutput:
     logits: Tensor                       # [B, 1, D, H, W]
     evidence: list[Tensor] | None = None  # three 8^3 maps, when asked for
     clause_tokens: Tensor | None = None   # [B, 3, E] fused clause tokens
+    #: [B, 3] predicted target centroid in world units, ordered (z, y, x), when
+    #: `config.centroid_head` is on. `None` otherwise.
+    centroid: Tensor | None = None
 
     def probabilities(self) -> Tensor:
         return torch.sigmoid(self.logits)
@@ -298,6 +320,17 @@ class RelationalVLM(nn.Module):
             share_branch_weights=cfg.share_branch_weights,
             activation=cfg.activation,
         )
+        # One 1x1x1 convolution to a single channel, read out by spatial
+        # soft-argmax. Deliberately not global-average-pooling into an MLP:
+        # pooling destroys exactly the position information the head exists to
+        # recover. The soft-argmax is position-aware, differentiable, costs
+        # `bottleneck_channels + 1` parameters, and its heatmap is directly
+        # interpretable.
+        self.centroid_head = (
+            nn.Conv3d(cfg.bottleneck_channels, 1, kernel_size=1)
+            if cfg.centroid_head
+            else None
+        )
         self.intersection = IntersectionFusion(
             cfg.evidence_width,
             cfg.intersection_hidden_channels,
@@ -346,6 +379,44 @@ class RelationalVLM(nn.Module):
         return masks
 
     # -- forward -----------------------------------------------------------
+    def predict_centroid(self, features: Tensor, volume_shape: Sequence[int]) -> Tensor:
+        """Spatial soft-argmax over the bottleneck -> a centroid in world units.
+
+        The head emits one heatmap logit per bottleneck cell; a softmax over the
+        spatial positions turns it into a distribution, and its expectation is
+        the predicted centroid. Sub-cell precision comes from the weighting, so
+        an 8^3 bottleneck is not limited to 8-voxel resolution.
+
+        Returns ``[B, 3]`` ordered ``(z, y, x)``, on the *full-resolution* world
+        grid: bottleneck cell ``i`` along an axis covers ``scale`` voxels and its
+        centre sits at ``i * scale + (scale - 1) / 2``.
+        """
+        if self.centroid_head is None:
+            raise RuntimeError("centroid_head is disabled in this model's config")
+        heat = self.centroid_head(features)
+        batch = heat.shape[0]
+        weights = torch.softmax(heat.reshape(batch, -1), dim=1).reshape_as(heat)
+
+        sx, sy, sz = (float(v) for v in self.config.spacing)
+        # Both tuples are (z, y, x); `spacing` is (x, y, z), as everywhere.
+        scale_z, scale_y, scale_x = (
+            float(full) / float(size)
+            for full, size in zip(volume_shape, heat.shape[2:])
+        )
+        centre = soft_centroid(
+            weights, spacing=(sx * scale_x, sy * scale_y, sz * scale_z)
+        )[:, 0]
+        offset = torch.tensor(
+            [
+                (scale_z - 1.0) / 2.0 * sz,
+                (scale_y - 1.0) / 2.0 * sy,
+                (scale_x - 1.0) / 2.0 * sx,
+            ],
+            device=centre.device,
+            dtype=centre.dtype,
+        )
+        return centre + offset
+
     def forward(
         self,
         anchor_masks: Tensor,
@@ -388,10 +459,16 @@ class RelationalVLM(nn.Module):
         logits = self.decoder(
             conditioned, features.skips, context, full_shape=volume_shape
         )
+        centroid = (
+            self.predict_centroid(conditioned, volume_shape)
+            if self.centroid_head is not None
+            else None
+        )
         return RelationalVLMOutput(
             logits=logits,
             evidence=evidence if return_evidence else None,
             clause_tokens=clause_tokens,
+            centroid=centroid,
         )
 
     @torch.no_grad()
@@ -416,10 +493,12 @@ def build_relational_vlm(
     variant: str = "full",
     input_resolution: int | None = None,
     spacing: Sequence[float] | None = None,
+    centroid_head: bool | None = None,
 ) -> RelationalVLM:
     """Construct Stage B from ``configs/model.yaml``."""
     config = RelationalVLMConfig.from_config(
-        profile=profile, variant=variant, input_resolution=input_resolution, spacing=spacing
+        profile=profile, variant=variant, input_resolution=input_resolution,
+        spacing=spacing, centroid_head=centroid_head,
     )
     if len(SHAPE_NAMES) != 10:  # pragma: no cover - the vocabulary is fixed
         raise ValueError(f"the shape vocabulary must have ten names, got {len(SHAPE_NAMES)}")

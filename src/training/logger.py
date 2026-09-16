@@ -132,6 +132,19 @@ def metrics_from_stage_b(
     hausdorff = overall.get("hausdorff")
     if _is_number(hausdorff):
         metrics["val_hausdorff"] = float(hausdorff)
+    centroid = overall.get("centroid")
+    if _is_number(centroid):
+        # Distance from the predicted centroid to the target's, in world units.
+        # Dice cannot distinguish a misplaced prediction from a badly-sized one;
+        # this can, which is why it is promoted to a headline field.
+        metrics["val_centroid"] = float(centroid)
+    baselines = val_metrics.get("centroid_baselines")
+    if isinstance(baselines, Mapping):
+        # `val_centroid` is uninterpretable without these: `anchor_union` is what
+        # a model that ignores the directions and points at the anchors scores.
+        metrics["val_centroid_baselines"] = {
+            name: float(value) for name, value in baselines.items() if _is_number(value)
+        }
     strata = val_metrics.get("strata") or {}
     target_shape = strata.get("target_shape") or {}
     if target_shape:
@@ -368,6 +381,7 @@ class TrainingLogger:
             "val_loss",
             "val_dice",
             "val_iou",
+            "val_centroid",
             "val_hausdorff",
         ]
         seen: set[str] = set()

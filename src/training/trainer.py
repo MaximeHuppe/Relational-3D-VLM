@@ -53,8 +53,11 @@ from src.training.logger import (
 from src.training.losses import (
     BCE_VARIANTS,
     DEFAULT_BCE_VARIANT,
+    DEFAULT_CENTROID_MIN_MASS,
     DEFAULT_FOCAL_ALPHA,
     DEFAULT_FOCAL_GAMMA,
+    DEFAULT_LAMBDA_CENTROID,
+    centroid_head_loss,
     deep_supervision_loss,
     segmentation_loss,
 )
@@ -90,7 +93,17 @@ def _cross_entropy_settings(loss: Mapping[str, Any]) -> dict[str, Any]:
         "bce_variant": str(loss.get("bce", DEFAULT_BCE_VARIANT)),
         "focal_gamma": float(loss.get("focal_gamma", DEFAULT_FOCAL_GAMMA)),
         "focal_alpha": None if alpha is None else float(alpha),
+        "lambda_centroid": float(loss.get("lambda_centroid", DEFAULT_LAMBDA_CENTROID)),
+        "centroid_min_mass": float(
+            loss.get("centroid_min_mass", DEFAULT_CENTROID_MIN_MASS)
+        ),
     }
+
+
+def _centroid_head_settings(loss: Mapping[str, Any]) -> dict[str, Any]:
+    """The head weight, kept out of `loss_kwargs`: the head is a second model
+    output, not something `segmentation_loss` can see from the logits alone."""
+    return {"lambda_centroid_head": float(loss.get("lambda_centroid_head", 0.0))}
 
 
 @dataclass(frozen=True)
@@ -116,6 +129,14 @@ class TrainingSettings:
     bce_variant: str = DEFAULT_BCE_VARIANT
     focal_gamma: float = DEFAULT_FOCAL_GAMMA
     focal_alpha: float | None = DEFAULT_FOCAL_ALPHA
+    # Auxiliary centroid term. 0 disables it; its magnitude is logged either
+    # way, so the weight can be calibrated from a run that did not use it.
+    lambda_centroid: float = DEFAULT_LAMBDA_CENTROID
+    centroid_min_mass: float = DEFAULT_CENTROID_MIN_MASS
+    # Weight on the auxiliary centroid-regression head. Inert unless the model
+    # was built with `centroid_head: true`; the head's error is logged either
+    # way, so it can be used purely as a probe at weight 0.
+    lambda_centroid_head: float = 0.0
     threshold: float = 0.5
     seed: int = 20260915
     model_profile: str = "default"
@@ -163,6 +184,7 @@ class TrainingSettings:
             lambda_dice=float(loss["lambda_dice"]),
             lambda_bce=float(loss["lambda_bce"]),
             **_cross_entropy_settings(loss),
+            **_centroid_head_settings(loss),
             threshold=float(stage.get("threshold", 0.5)),
             seed=int(common["seed"]),
             model_profile=str(hardware.get("model_profile", "default")),
@@ -222,6 +244,7 @@ class TrainingSettings:
             lambda_dice=float(loss["lambda_dice"]),
             lambda_bce=float(loss["lambda_bce"]),
             **_cross_entropy_settings(loss),
+            **_centroid_head_settings(loss),
             threshold=float(stage.get("threshold", 0.5)),
             seed=int(common["seed"]),
             model_profile=str(hardware.get("model_profile", "default")),
@@ -256,6 +279,12 @@ class TrainingSettings:
             raise ValueError(
                 f"focal_alpha must lie in [0, 1] or be None, got {self.focal_alpha}"
             )
+        if self.lambda_centroid < 0:
+            raise ValueError(f"lambda_centroid must be >= 0, got {self.lambda_centroid}")
+        if self.lambda_centroid_head < 0:
+            raise ValueError(
+                f"lambda_centroid_head must be >= 0, got {self.lambda_centroid_head}"
+            )
 
     @property
     def loss_kwargs(self) -> dict[str, Any]:
@@ -270,6 +299,8 @@ class TrainingSettings:
             "bce_variant": self.bce_variant,
             "focal_gamma": self.focal_gamma,
             "focal_alpha": self.focal_alpha,
+            "lambda_centroid": self.lambda_centroid,
+            "centroid_min_mass": self.centroid_min_mass,
         }
 
     @property
@@ -773,12 +804,31 @@ class StageBTrainer:
         anchor_masks = self.anchor_provider(batch).to(self.device)
         return self.model(**stage_b_model_inputs(batch, anchor_masks))
 
-    def _loss(self, logits: Tensor, batch: Mapping[str, Any]):
-        return segmentation_loss(
+    def _loss(self, output: Any, batch: Mapping[str, Any]):
+        """Total loss for one batch, plus its detached components.
+
+        Takes the whole model output rather than the logits: the centroid head
+        is a second output, and its error is reported whenever the head exists
+        even if `lambda_centroid_head` is 0 - that is the configuration in which
+        the head is used purely as a probe of whether the encoder knows where the
+        target is while the decoder fails to put the mask there.
+        """
+        logits = output if isinstance(output, Tensor) else output.logits
+        total, components = segmentation_loss(
             logits.float(),
             batch["target_mask"],
             **self.settings.loss_kwargs,
+            spacing=self.spacing,
         )
+        centroid = getattr(output, "centroid", None)
+        if centroid is not None:
+            head = centroid_head_loss(
+                centroid.float(), batch["target_mask"], spacing=self.spacing
+            )
+            components["centroid_head"] = float(head.detach())
+            if self.settings.lambda_centroid_head:
+                total = total + self.settings.lambda_centroid_head * head
+        return total, components
 
     # -- training ----------------------------------------------------------
     def train_epoch(self, epoch: int) -> tuple[float, dict[str, float], float]:
@@ -800,7 +850,7 @@ class StageBTrainer:
             batch = self._to_device(raw)
             with self._autocast():
                 output = self._forward(batch)
-            loss, components = self._loss(output.logits, batch)
+            loss, components = self._loss(output, batch)
             self.scaler.scale(loss / accumulation).backward()
             if (index + 1) % accumulation == 0:
                 self.scaler.step(self.optimizer)
@@ -867,7 +917,7 @@ class StageBTrainer:
             batch = self._to_device(raw)
             with self._autocast():
                 output = self._forward(batch)
-            loss, _ = self._loss(output.logits, batch)
+            loss, _ = self._loss(output, batch)
             total_loss += float(loss)
             steps += 1
             metrics.update(
@@ -881,6 +931,7 @@ class StageBTrainer:
                 with_hausdorff=with_hausdorff,
                 percentile=percentile,
                 spacing=self.spacing,
+                anchor_union=batch["anchor_union_mask"].cpu(),
             )
         summary = metrics.summary()
         summary["loss"] = total_loss / max(steps, 1)
@@ -1058,7 +1109,7 @@ class StageBOverfitRunner(StageBTrainer):
                     batch = self._to_device(raw)
                     with self._autocast():
                         output = self._forward(batch)
-                    loss, components = self._loss(output.logits, batch)
+                    loss, components = self._loss(output, batch)
                     self.scaler.scale(loss / accumulation).backward()
                     if (index + 1) % accumulation == 0:
                         self.scaler.step(self.optimizer)

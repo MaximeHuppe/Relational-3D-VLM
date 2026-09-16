@@ -18,6 +18,7 @@ import numpy as np
 import pytest
 import torch
 
+from src.config import load_config
 from src.data.dataset import (
     DatasetError,
     ExampleDataset,
@@ -335,7 +336,12 @@ def test_stage_b_settings_resolve_from_the_config():
     overfit = TrainingSettings.for_stage_b(phase="overfit")
     oracle = TrainingSettings.for_stage_b(phase="oracle")
     assert overfit.steps > 0 and overfit.target_train_dice == 0.95
-    assert oracle.epochs == 100 and oracle.anchor_source == "oracle"
+    # Resolved from the config, not pinned to a literal: `epochs` is a tuning
+    # knob and a hardcoded value here fails every time an experiment changes it.
+    configured = load_config("train")["stage_b_oracle"]
+    assert oracle.epochs == int(configured["epochs"]) and oracle.epochs > 0
+    assert oracle.anchor_source == "oracle"
+    assert oracle.learning_rate == float(configured["optimizer"]["lr"])
     smoke = TrainingSettings.for_stage_b(phase="oracle", smoke=True)
     assert smoke.model_profile == "smoke" and smoke.epochs < oracle.epochs
     assert TrainingSettings.for_stage_b(phase="oracle", overrides={"epochs": 2}).epochs == 2

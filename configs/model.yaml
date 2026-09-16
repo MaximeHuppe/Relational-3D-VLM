@@ -131,6 +131,16 @@ stage_b:
       type: film                     # lightweight FiLM / gating
       at_resolutions: [16, 32]
 
+  # Auxiliary centroid-regression head on the bottleneck: one 1x1x1 convolution
+  # read out by spatial soft-argmax, so it costs `bottleneck_channels + 1`
+  # parameters (33 at the smoke width, 257 at the default one). Off by default,
+  # which keeps a built model parameter-identical to every existing checkpoint.
+  # It supervises WHERE the target is independently of the decoder, and doubles
+  # as a probe: a head that localises well while the mask's own centroid does
+  # not means the encoder has the information and the decoder is not using it.
+  # See docs/stage_b_tuning_plan.md section 5.5.
+  centroid_head: false
+
   output:
     return_logits: true
     return_probabilities: true       # sigmoid, at evaluation time
