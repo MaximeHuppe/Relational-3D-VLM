@@ -4,8 +4,10 @@ Covers the promises the relational architecture makes, not its accuracy:
 
 * the target logit volume comes back at the input resolution, from a 512-token
   bottleneck - full-resolution attention is never built;
-* the forward signature cannot accept the scene, the labels, the target mask or
-  any target identity, and the dataset's input helper hands over nothing else;
+* the forward signature takes the three ordered anchors, the prompt indices
+  and ``scene_volume`` occupancy, and cannot accept instance labels, the
+  target mask or any target identity; the dataset's input helper hands over
+  those four tensors and nothing else;
 * the natural-language and structured prompt paths produce the same three
   clause tokens;
 * anchor geometry is measured from the mask channels, and matches the manifest
@@ -30,7 +32,7 @@ from src.data.prompt_generator import clause_indices, clauses_from_indices
 from src.data.schema import STAGE_B_FORBIDDEN_FIELDS
 from src.models.blocks import normalized_world_grid
 from src.models.cross_modal_fusion import ClauseFusion, CrossModalFusion
-from src.models.decoder import FiLM3d
+from src.models.decoder import FiLM3d, RelationalDecoder
 from src.models.intersection_fusion import IntersectionFusion
 from src.models.prompt_encoder import RelationPromptEncoder
 from src.models.relational_encoder import RelationalEncoder
@@ -108,16 +110,28 @@ def prompt_ids(batch: int = 2) -> tuple[torch.Tensor, torch.Tensor]:
     )
 
 
+def scene(batch: int = 2, size: int = 16) -> torch.Tensor:
+    """Matching occupancy grid. Occupancy-specific tests build a richer volume."""
+    return torch.zeros(batch, 1, size, size, size)
+
+
+def occupied(batch: int = 1, size: int = 16) -> torch.Tensor:
+    """Anchors plus a disjoint blob the relations did not name."""
+    volume = anchors(batch, size).amax(dim=1, keepdim=True).clone()
+    volume[:, :, size - 4 : size - 2, size - 4 : size - 2, size - 4 : size - 2] = 1
+    return volume
+
+
 # ---------------------------------------------------------------------------
 # Shapes
 # ---------------------------------------------------------------------------
 def test_the_output_is_one_target_logit_volume_at_the_input_resolution(model):
-    output = model(anchors(), *prompt_ids())
+    output = model(anchors(), *prompt_ids(), scene())
     assert output.logits.shape == (2, 1, 16, 16, 16)
 
 
 def test_probabilities_and_binary_mask(model):
-    output = model(anchors(1), *prompt_ids(1))
+    output = model(anchors(1), *prompt_ids(1), scene(1))
     probabilities = output.probabilities()
     assert probabilities.min() >= 0.0 and probabilities.max() <= 1.0
     mask = output.binary_mask(0.5)
@@ -135,7 +149,7 @@ def test_the_bottleneck_is_the_512_token_budget_claude_md_sets():
 
 
 def test_evidence_maps_live_at_the_bottleneck_not_at_full_resolution(model):
-    output = model(anchors(1), *prompt_ids(1), return_evidence=True)
+    output = model(anchors(1), *prompt_ids(1), scene(1), return_evidence=True)
     assert len(output.evidence) == 3
     for evidence in output.evidence:
         assert tuple(evidence.shape[2:]) == (2, 2, 2)  # the TINY bottleneck
@@ -144,20 +158,33 @@ def test_evidence_maps_live_at_the_bottleneck_not_at_full_resolution(model):
 
 def test_the_head_starts_at_the_foreground_prior_not_at_one_half(model):
     """A zero-init head would predict p = 0.5 for a quarter of a million voxels."""
-    probabilities = model(anchors(1), *prompt_ids(1)).probabilities()
+    probabilities = model(anchors(1), *prompt_ids(1), scene(1)).probabilities()
     assert probabilities.mean() < 0.01
 
 
 # ---------------------------------------------------------------------------
 # Input contract
 # ---------------------------------------------------------------------------
-def test_the_forward_signature_cannot_take_the_scene_or_the_target():
+def test_the_forward_signature_takes_occupancy_but_not_the_target():
     parameters = list(inspect.signature(RelationalVLM.forward).parameters)
     assert parameters == [
-        "self", "anchor_masks", "direction_ids", "anchor_shape_ids", "return_evidence"
+        "self",
+        "anchor_masks",
+        "direction_ids",
+        "anchor_shape_ids",
+        "scene_volume",
+        "return_evidence",
     ]
     for forbidden in STAGE_B_FORBIDDEN_FIELDS:
         assert forbidden not in parameters
+
+
+def test_the_encoder_still_takes_three_channels_when_occupancy_is_on(model):
+    assert model.config.use_occupancy
+    assert model.encoder.in_channels == 3
+    parameters = list(inspect.signature(model.encoder.forward).parameters)
+    assert "scene_volume" not in parameters
+    assert "occupancy" not in parameters
 
 
 def test_the_dataset_helper_passes_only_the_permitted_inputs():
@@ -172,25 +199,74 @@ def test_the_dataset_helper_passes_only_the_permitted_inputs():
         "target_shape_name": ["cube"],
     }
     inputs = stage_b_model_inputs(batch)
-    assert set(inputs) == {"anchor_masks", "direction_ids", "anchor_shape_ids"}
+    assert set(inputs) == {
+        "anchor_masks",
+        "direction_ids",
+        "anchor_shape_ids",
+        "scene_volume",
+    }
+    assert "target_mask" not in inputs
+    assert "target_shape_name" not in inputs
     for forbidden in STAGE_B_FORBIDDEN_FIELDS:
         assert forbidden not in inputs
-    # A predicted-anchor call swaps the channels and nothing else.
     swapped = stage_b_model_inputs(batch, torch.zeros_like(batch["anchor_masks"]))
     assert set(swapped) == set(inputs)
     assert float(swapped["anchor_masks"].sum()) == 0.0
+    assert torch.equal(swapped["scene_volume"], batch["scene_volume"])
+
+
+def test_prepare_occupancy_zeros_anchor_voxels_when_masking_is_on(model):
+    masks = anchors(1)
+    volume = occupied(1)
+    prepared = model.prepare_occupancy(volume, masks)
+    union = masks.amax(dim=1, keepdim=True)
+    expected = volume * (1.0 - union)
+    assert torch.equal(prepared, expected)
+    assert float(prepared[union.bool()].abs().sum()) == 0.0
+    leftover = (volume > 0) & (union == 0)
+    assert torch.equal(prepared[leftover], volume[leftover])
+
+
+def test_mutating_occupancy_of_a_non_anchor_object_changes_logits(probe):
+    masks = anchors(1)
+    volume = occupied(1)
+    flipped = volume.clone()
+    flipped[:, :, 12:14, 12:14, 12:14] = 0
+    directions, shapes = prompt_ids(1)
+    with torch.no_grad():
+        reference = probe(masks, directions, shapes, volume).logits
+        mutated = probe(masks, directions, shapes, flipped).logits
+    assert reference.shape == (1, 1, 16, 16, 16)
+    assert not torch.allclose(reference, mutated, atol=1e-4)
+
+
+def test_mutating_occupancy_inside_an_anchor_does_not_change_logits_when_masked(probe):
+    masks = anchors(1)
+    volume = occupied(1)
+    mutated = volume.clone()
+    mutated[:, 0] = torch.where(masks[:, 0] > 0.5, 1.0 - mutated[:, 0], mutated[:, 0])
+    directions, shapes = prompt_ids(1)
+    with torch.no_grad():
+        reference = probe(masks, directions, shapes, volume).logits
+        inside = probe(masks, directions, shapes, mutated).logits
+    assert torch.equal(reference, inside)
+
+
+def test_scene_volume_must_match_the_anchor_mask_grid(model):
+    with pytest.raises(ValueError, match="spatial size"):
+        model(anchors(1), *prompt_ids(1), scene(1, size=8))
 
 
 def test_malformed_inputs_are_rejected(model):
     directions, shapes = prompt_ids(2)
     with pytest.raises(ValueError):
-        model(anchors(2)[:, :2], directions, shapes)          # two channels
+        model(anchors(2)[:, :2], directions, shapes, scene(2))          # two channels
     with pytest.raises(ValueError):
-        model(anchors(1), directions, shapes)                 # batch mismatch
+        model(anchors(1), directions, shapes, scene(1))                 # batch mismatch
     with pytest.raises(ValueError):
-        model(anchors(2), directions[:, :2], shapes[:, :2])   # two clauses
+        model(anchors(2), directions[:, :2], shapes[:, :2], scene(2))   # two clauses
     with pytest.raises(ValueError):
-        model(anchors(2), directions, shapes + 100)           # out of vocabulary
+        model(anchors(2), directions, shapes + 100, scene(2))           # out of vocabulary
 
 
 # ---------------------------------------------------------------------------
@@ -266,7 +342,7 @@ def test_an_empty_anchor_channel_is_handled_rather_than_producing_nan():
 
     torch.manual_seed(0)
     net = RelationalVLM(TINY)
-    logits = net(masks, *prompt_ids(1)).logits
+    logits = net(masks, *prompt_ids(1), scene(1)).logits
     assert torch.isfinite(logits).all()
 
 
@@ -299,8 +375,8 @@ def test_permuting_the_channels_with_the_prompt_fixed_changes_the_prediction(pro
     masks = anchors(1)
     directions, shapes = prompt_ids(1)
     with torch.no_grad():
-        reference = probe(masks, directions, shapes).logits
-        permuted = probe(masks[:, [2, 0, 1]], directions, shapes).logits
+        reference = probe(masks, directions, shapes, scene(1)).logits
+        permuted = probe(masks[:, [2, 0, 1]], directions, shapes, scene(1)).logits
     assert not torch.allclose(reference, permuted, atol=1e-4)
 
 
@@ -308,8 +384,8 @@ def test_permuting_the_clauses_with_the_channels_fixed_changes_the_prediction(pr
     masks = anchors(1)
     directions, shapes = prompt_ids(1)
     with torch.no_grad():
-        reference = probe(masks, directions, shapes).logits
-        permuted = probe(masks, directions[:, [2, 0, 1]], shapes[:, [2, 0, 1]]).logits
+        reference = probe(masks, directions, shapes, scene(1)).logits
+        permuted = probe(masks, directions[:, [2, 0, 1]], shapes[:, [2, 0, 1]], scene(1)).logits
     assert not torch.allclose(reference, permuted, atol=1e-4)
 
 
@@ -321,9 +397,9 @@ def test_flipping_one_direction_or_renaming_one_anchor_changes_the_prediction(pr
     renamed = shapes.clone()
     renamed[0, 2] = (renamed[0, 2] + 1) % 10
     with torch.no_grad():
-        reference = probe(masks, directions, shapes).logits
-        flipped = probe(masks, opposite, shapes).logits
-        substituted = probe(masks, directions, renamed).logits
+        reference = probe(masks, directions, shapes, scene(1)).logits
+        flipped = probe(masks, opposite, shapes, scene(1)).logits
+        substituted = probe(masks, directions, renamed, scene(1)).logits
     assert not torch.allclose(reference, flipped, atol=1e-4)
     assert not torch.allclose(reference, substituted, atol=1e-4)
 
@@ -334,8 +410,8 @@ def test_removing_one_anchor_changes_the_prediction(probe):
     dropped[:, 1] = 0
     directions, shapes = prompt_ids(1)
     with torch.no_grad():
-        reference = probe(masks, directions, shapes).logits
-        without = probe(dropped, directions, shapes).logits
+        reference = probe(masks, directions, shapes, scene(1)).logits
+        without = probe(dropped, directions, shapes, scene(1)).logits
     assert not torch.allclose(reference, without, atol=1e-4)
 
 
@@ -359,7 +435,7 @@ def test_every_declared_variant_builds_and_runs():
         net = build_relational_vlm("smoke", variant=variant)
         with torch.no_grad():
             logits = net(
-                torch.zeros(1, 3, 64, 64, 64), *prompt_ids(1)
+                torch.zeros(1, 3, 64, 64, 64), *prompt_ids(1), scene(1, 64)
             ).logits
         assert logits.shape == (1, 1, 64, 64, 64)
     with pytest.raises(ValueError):
@@ -383,13 +459,21 @@ def test_configuration_errors_are_caught_at_construction():
         RelationalVLMConfig(anchor_representation="mean")
 
 
+def test_from_config_reads_the_occupancy_block():
+    config = RelationalVLMConfig.from_config(profile="smoke")
+    assert config.use_occupancy
+    assert config.mask_occupancy_anchors
+    assert config.occupancy_at == (16, 32, 64)
+    assert config.in_channels == 3
+
+
 # ---------------------------------------------------------------------------
 # Components
 # ---------------------------------------------------------------------------
 def test_gradients_reach_every_parameter():
     torch.manual_seed(0)
     net = RelationalVLM(TINY)
-    net(anchors(1), *prompt_ids(1)).logits.square().mean().backward()
+    net(anchors(1), *prompt_ids(1), scene(1)).logits.square().mean().backward()
     missing = [name for name, p in net.named_parameters() if p.grad is None]
     assert not missing, f"no gradient reached: {missing}"
 
@@ -441,3 +525,41 @@ def test_film_starts_as_the_identity():
     film = FiLM3d(6, 4)
     features = torch.randn(2, 4, 3, 3, 3)
     assert torch.allclose(film(features, torch.randn(2, 6)), features)
+
+
+def test_occupancy_is_concatenated_at_named_decoder_scales_not_the_bottleneck():
+    decoder = RelationalDecoder(
+        4,
+        (8, 4, 2),
+        (8, 4, 2),
+        6,
+        stage_resolutions=(16, 32, 64),
+        occupancy_at=(16, 32, 64),
+        condition_at=(16, 32),
+        coordinate_features=False,
+    )
+    assert set(decoder.occ_proj) == {"0", "1", "2"}
+    assert 8 not in decoder.occupancy_at
+    bottleneck = torch.randn(1, 4, 8, 8, 8)
+    skips = (
+        torch.randn(1, 8, 16, 16, 16),
+        torch.randn(1, 4, 32, 32, 32),
+        torch.randn(1, 2, 64, 64, 64),
+    )
+    context = torch.randn(1, 6)
+    occupancy = torch.ones(1, 1, 64, 64, 64)
+    with torch.no_grad():
+        with_occ = decoder(
+            bottleneck, skips, context, occupancy=occupancy, full_shape=(64, 64, 64)
+        )
+        without = decoder(
+            bottleneck, skips, context, occupancy=None, full_shape=(64, 64, 64)
+        )
+    assert with_occ.shape == (1, 1, 64, 64, 64)
+    assert without.shape == with_occ.shape
+
+
+def test_tiny_occupancy_is_injected_at_full_res_not_the_bottleneck(model):
+    assert model.config.decoder_resolutions == (4, 8, 16)
+    assert set(model.decoder.occ_proj) == {"2"}
+    assert model.encoder.in_channels == 3

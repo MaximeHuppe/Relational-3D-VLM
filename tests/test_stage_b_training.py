@@ -6,8 +6,8 @@ target/prediction misalignment, without depending on any particular accuracy.
 
 The anchor-source tests are the important ones: they check that the ground-truth
 and Stage A-predicted paths are interchangeable, that the predicted path really
-does swap the channels, and that the scene volume it needs never reaches
-Stage B.
+does swap the channels, and that the same ``scene_volume`` goes to Stage A and
+Stage B while ``instance_labels`` still does not.
 """
 
 from __future__ import annotations
@@ -95,7 +95,8 @@ def test_items_match_the_stage_b_contract(dataset):
     assert (item["anchor_masks"].sum(dim=(1, 2, 3)) > 0).all()
     assert float(item["anchor_masks"].sum(0).max()) == 1.0
     assert float((item["anchor_masks"].sum(0) * item["target_mask"][0]).sum()) == 0.0
-    assert "scene_volume" not in item
+    assert item["scene_volume"].shape == (1, depth, height, width)
+    assert set(item["scene_volume"].unique().tolist()) <= {0.0, 1.0}
 
 
 def test_the_channels_are_the_three_anchor_structures_of_the_scene(dataset):
@@ -121,12 +122,14 @@ def test_the_prompt_indices_match_the_manifest_clauses(dataset):
     assert item["directions"] == [clause["direction"] for clause in relations]
 
 
-def test_the_scene_volume_is_opt_in_and_only_for_predicted_anchors(dataset, scene_dataset):
-    assert "scene_volume" not in dataset[0]
-    item = scene_dataset[0]
-    assert item["scene_volume"].shape == (1, *scene_dataset.volume_shape)
-    # ...and it is not a Stage B input even when the dataset carries it.
-    assert "scene_volume" not in stage_b_model_inputs(item)
+def test_oracle_items_include_scene_volume_as_a_stage_b_input(dataset):
+    item = dataset[0]
+    assert item["scene_volume"].shape == (1, *dataset.volume_shape)
+    inputs = stage_b_model_inputs(item)
+    assert "scene_volume" in inputs
+    assert torch.equal(inputs["scene_volume"], item["scene_volume"])
+    assert "target_mask" not in inputs
+    assert "target_shape_name" not in inputs
 
 
 def test_split_filtering_and_scene_selection():
@@ -205,14 +208,18 @@ def test_the_predicted_provider_segments_the_named_anchors_in_clause_order(scene
     assert provider.anchor_quality() == {}
 
 
-def test_predicted_anchors_need_the_scene_volume_and_a_checkpoint(dataset):
+def test_predicted_anchors_need_the_scene_volume_and_a_checkpoint():
+    try:
+        stripped = ExampleDataset(SMOKE_ROOT, "train", limit=4, include_scene_volume=False)
+    except DatasetError as error:  # pragma: no cover
+        pytest.skip(f"smoke corpus unavailable: {error}")
     torch.manual_seed(0)
     stage_a = ShapeSegmenter(
         type(TINY_STAGE_A)(**{**TINY_STAGE_A.__dict__, "input_resolution": 64, "bottleneck_resolution": 8})
     )
     provider = PredictedAnchorProvider(model=stage_a)
     with pytest.raises(AnchorProviderError):
-        provider(collate_examples([dataset[0]]))       # dataset built without it
+        provider(collate_examples([stripped[0]]))       # occupancy stripped for this probe
     with pytest.raises(AnchorProviderError):
         build_anchor_provider("predicted")             # no checkpoint
     with pytest.raises(AnchorProviderError):
@@ -235,9 +242,16 @@ def test_stage_b_gets_the_same_interface_from_either_source(scene_dataset):
     batch = collate_examples([scene_dataset[0]])
     for provider in (OracleAnchorProvider(), PredictedAnchorProvider(model=stage_a)):
         inputs = stage_b_model_inputs(batch, provider(batch))
-        assert set(inputs) == {"anchor_masks", "direction_ids", "anchor_shape_ids"}
+        assert set(inputs) == {
+            "anchor_masks",
+            "direction_ids",
+            "anchor_shape_ids",
+            "scene_volume",
+        }
+        assert torch.equal(inputs["scene_volume"], batch["scene_volume"])
         for forbidden in STAGE_B_FORBIDDEN_FIELDS:
             assert forbidden not in inputs
+        assert "instance_labels" not in inputs
         with torch.no_grad():
             logits = model(**inputs).logits
         assert logits.shape == (1, 1, 64, 64, 64)
@@ -431,7 +445,11 @@ def test_the_trainer_never_hands_the_target_mask_to_the_model(dataset, tmp_path)
         output_dir=tmp_path, verbose=False,
     )
     trainer.train_epoch(0)
-    assert seen and all(call == {"anchor_masks", "direction_ids", "anchor_shape_ids"} for call in seen)
+    assert seen and all(
+        call == {"anchor_masks", "direction_ids", "anchor_shape_ids", "scene_volume"}
+        for call in seen
+    )
+    assert all("target_mask" not in call for call in seen)
 
 
 def test_resolve_device_and_manifest_reading_still_agree(dataset):

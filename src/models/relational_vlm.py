@@ -1,16 +1,16 @@
 """Stage B end to end: the relational target segmenter.
 
-Inputs are exactly three things: the ordered binary anchor-mask channels, the
-structured three-clause prompt (as closed-vocabulary indices) and geometry
-features **derived from those masks**. The model never receives ``scene_volume``,
-``instance_labels``, the target mask, the target class, the target centroid or
-the target instance ID - see :data:`src.data.schema.STAGE_B_FORBIDDEN_FIELDS`.
-The contract is enforced by construction rather than by convention: the forward
-signature has nowhere to put any of them.
+Inputs are the ordered binary anchor-mask channels, the structured three-clause
+prompt (as closed-vocabulary indices), geometry features **derived from those
+masks**, and the binary scene occupancy. Occupancy is a decoder-side WHAT
+stream: the encoder, fusion and intersection never see it. The model still must
+not receive ``instance_labels``, the target mask, the target class, the target
+centroid or the target instance ID - see
+:data:`src.data.schema.STAGE_B_FORBIDDEN_FIELDS`.
 
 Pipeline::
 
-    anchor_masks [B, 3, 64, 64, 64]  ->  RelationalEncoder
+    anchor_masks [B, 3, 64, 64, 64]  ->  RelationalEncoder   (WHERE)
         64^3 -> 32^3 -> 16^3 -> 8^3, world (x, y, z) injected at every scale
 
     direction_ids, anchor_shape_ids   ->  RelationPromptEncoder  -> R [B, 3, E]
@@ -21,7 +21,9 @@ Pipeline::
                    -> evidence map H_i at 8^3
     IntersectionFusion([H_1, H_2, H_3, H_1*H_2*H_3]) -> conditioned bottleneck
 
+    scene_volume [B, 1, 64, 64, 64]  ->  occupancy, anchors masked out by default
     RelationalDecoder: 8^3 -> 16^3 -> 32^3 -> 64^3, skips + FiLM at 16^3/32^3
+        occupancy concatenated at 16^3 / 32^3 / 64^3 after the skip merge (WHAT)
     head -> one target logit volume [B, 1, 64, 64, 64]
 
 Anchor source is *not* this model's concern. It consumes whatever three ordered
@@ -30,13 +32,15 @@ oracle) or Stage A's predictions for the three named anchors (Phase 4). Because
 every geometric feature is measured from the channels themselves
 (:mod:`src.models.structure_encoder`), the two sources are interchangeable and
 the oracle-vs-predicted delta measures Stage A's error, not a change of
-interface. See :mod:`src.models.anchor_provider`.
+interface. The same ``scene_volume`` tensor that Stage A segments is also
+passed to this decoder. See :mod:`src.models.anchor_provider`.
 
 Baseline variants (``configs/model.yaml: baselines``) are selected by
 :class:`RelationalVLMConfig`: ``full`` (the main model), ``anchor_masks_only``
 (no prompt), ``prompt_only`` (coordinates, no masks) and
 ``prompt_plus_union_mask`` (the union ablation CLAUDE.md allows only as a
-baseline).
+baseline). Occupancy stays on for all of them unless ``use_occupancy`` is
+turned off.
 """
 
 from __future__ import annotations
@@ -115,6 +119,9 @@ class RelationalVLMConfig:
     anchor_representation: str = "ordered_channels"
     use_prompt: bool = True
     use_anchor_masks: bool = True
+    use_occupancy: bool = True
+    mask_occupancy_anchors: bool = True
+    occupancy_at: tuple[int, ...] = (16, 32, 64)
 
     def __post_init__(self) -> None:
         if len(self.encoder_channels) != 4:
@@ -211,6 +218,7 @@ class RelationalVLMConfig:
         fusion = stage["fusion"]
         structure = stage["structure_encoder"]
         prompt = stage["prompt_encoder"]
+        occupancy = dict(stage.get("occupancy") or {})
         resolution = int(input_resolution or stage["resolutions"][0])
         return cls.for_variant(
             variant,
@@ -236,6 +244,11 @@ class RelationalVLMConfig:
                 stage["output"].get("prior_foreground_fraction", 0.0016)
             ),
             spacing=tuple(float(v) for v in (spacing or (1.0, 1.0, 1.0))),
+            use_occupancy=bool(occupancy.get("enabled", True)),
+            mask_occupancy_anchors=bool(occupancy.get("mask_anchors", True)),
+            occupancy_at=tuple(
+                int(v) for v in occupancy.get("inject_at_resolutions", (16, 32, 64))
+            ),
         )
 
 
@@ -315,6 +328,7 @@ class RelationalVLM(nn.Module):
             align_corners=cfg.align_corners,
             activation=cfg.activation,
             condition_at=cfg.condition_at,
+            occupancy_at=cfg.occupancy_at,
             out_channels=cfg.out_channels,
             coordinate_features=cfg.coordinate_features,
             spacing=cfg.spacing,
@@ -345,12 +359,39 @@ class RelationalVLM(nn.Module):
             return masks.amax(dim=1, keepdim=True)
         return masks
 
+    def prepare_occupancy(self, scene_volume: Tensor, masks: Tensor) -> Tensor:
+        """Binary occupancy at the mask grid, with the three anchors zeroed.
+
+        ``masks`` is the encoder input after :meth:`prepare_masks`, so the
+        prompt-only baseline (zeroed anchors) leaves the full scene and the
+        union baseline subtracts the single union channel.
+        """
+        if scene_volume.ndim != 5 or scene_volume.shape[1] != 1:
+            raise ValueError(
+                f"scene_volume must be [B, 1, D, H, W], got {tuple(scene_volume.shape)}"
+            )
+        if scene_volume.shape[0] != masks.shape[0]:
+            raise ValueError(
+                f"batch mismatch: scene_volume {scene_volume.shape[0]} vs masks "
+                f"{masks.shape[0]}"
+            )
+        if tuple(scene_volume.shape[2:]) != tuple(masks.shape[2:]):
+            raise ValueError(
+                f"scene_volume spatial size {tuple(scene_volume.shape[2:])} must match "
+                f"anchor_masks {tuple(masks.shape[2:])}"
+            )
+        occupancy = scene_volume.to(dtype=torch.float32)
+        if self.config.mask_occupancy_anchors:
+            occupancy = occupancy * (1.0 - masks.amax(dim=1, keepdim=True))
+        return occupancy
+
     # -- forward -----------------------------------------------------------
     def forward(
         self,
         anchor_masks: Tensor,
         direction_ids: Tensor,
         anchor_shape_ids: Tensor,
+        scene_volume: Tensor,
         *,
         return_evidence: bool = False,
     ) -> RelationalVLMOutput:
@@ -361,6 +402,8 @@ class RelationalVLM(nn.Module):
                 slot. Channel ``i`` must be the anchor named in clause ``i``.
             direction_ids: ``[B, 3]`` zero-based direction indices.
             anchor_shape_ids: ``[B, 3]`` zero-based shape indices.
+            scene_volume: ``[B, 1, D, H, W]`` binary occupancy of the whole
+                scene. Passed to the decoder only; the encoder never sees it.
             return_evidence: also return the three 8^3 evidence maps.
         """
         if direction_ids.shape != anchor_shape_ids.shape:
@@ -376,6 +419,9 @@ class RelationalVLM(nn.Module):
 
         masks = self.prepare_masks(anchor_masks)
         volume_shape = tuple(anchor_masks.shape[2:])
+        occupancy = (
+            self.prepare_occupancy(scene_volume, masks) if self.config.use_occupancy else None
+        )
         features = self.encoder(masks, volume_shape)
 
         relation_tokens = self.prompt_encoder(direction_ids, anchor_shape_ids)
@@ -386,7 +432,11 @@ class RelationalVLM(nn.Module):
         conditioned = features.bottleneck + self.intersection(evidence)
         context = clause_tokens.flatten(1)
         logits = self.decoder(
-            conditioned, features.skips, context, full_shape=volume_shape
+            conditioned,
+            features.skips,
+            context,
+            occupancy=occupancy,
+            full_shape=volume_shape,
         )
         return RelationalVLMOutput(
             logits=logits,
@@ -400,12 +450,13 @@ class RelationalVLM(nn.Module):
         anchor_masks: Tensor,
         direction_ids: Tensor,
         anchor_shape_ids: Tensor,
+        scene_volume: Tensor,
         *,
         threshold: float | None = None,
     ) -> tuple[Tensor, Tensor]:
         """``-> (probabilities, binary_mask)`` at the configured threshold."""
         self.eval()
-        output = self(anchor_masks, direction_ids, anchor_shape_ids)
+        output = self(anchor_masks, direction_ids, anchor_shape_ids, scene_volume)
         cutoff = self.config.binary_threshold if threshold is None else threshold
         return output.probabilities(), output.binary_mask(cutoff)
 

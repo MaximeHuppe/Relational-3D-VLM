@@ -22,11 +22,11 @@ The two providers are interchangeable at the call site::
     masks = provider(batch)                               # [B, 3, D, H, W]
     output = model(**stage_b_model_inputs(batch, masks))
 
-Note what the predicted provider does *not* do: the scene volume it consumes
-goes into Stage A and stops there. Stage B still receives only three mask
-channels, so the forbidden-field contract holds in both modes - which is the
-whole point of routing the choice through a provider instead of widening Stage
-B's inputs.
+Note what the predicted provider does *not* do: it never turns the scene into
+``instance_labels``. The same binary ``scene_volume`` has two consumers —
+Stage A produces the three ordered anchors from it, and Stage B's decoder
+reads it as occupancy — and both still go through
+:func:`src.data.dataset.stage_b_model_inputs`. Instance maps stay out.
 
 The predicted provider also scores its own output against the ground-truth
 channels when the batch carries them, so a run can report *why* Stage B degraded

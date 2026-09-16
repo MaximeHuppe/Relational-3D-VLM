@@ -130,11 +130,12 @@ small fixture batch are committed.
 ## Stage B input contract
 
 `src.data.schema.stage_b_inputs()` returns the only fields the relational model
-may consume: `anchor_masks`, `structured_prompt`, `prompt`,
+may consume: `anchor_masks`, `scene_volume`, `structured_prompt`, `prompt`,
 `anchor_shape_names`, `anchor_centroids_world`, `anchor_extents_world`,
 `volume_shape`, `spacing`.
 
-`STAGE_B_FORBIDDEN_FIELDS` — `scene_volume`, `instance_labels`, `target_mask`,
+`STAGE_B_FORBIDDEN_FIELDS` — `instance_labels`, `target_mask`,
 `target_shape_name`, `target_instance_id`, `target_centroid_world` — must never
-reach Stage B. `anchor_union_mask` is reachable only through
+reach Stage B. Binary `scene_volume` is occupancy (no instance ids) and is a
+decoder input. `anchor_union_mask` is reachable only through
 `stage_b_inputs(..., use_union_mask=True)`, which is the ablation baseline.

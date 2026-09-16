@@ -24,6 +24,7 @@ from torch import Tensor, nn
 from src.models.blocks import (
     UpBlock,
     conv3d,
+    downsample_masks,
     make_activation,
     norm3d,
     normalized_world_grid,
@@ -61,6 +62,9 @@ class RelationalDecoder(nn.Module):
         decoder_channels: output widths of the three decoder stages.
         context_dim: width of the flattened clause context.
         condition_at: decoder output resolutions that get FiLM (16 and 32).
+        occupancy_at: decoder output resolutions that concatenate the occupancy
+            channel after the skip merge. Default 16/32/64; never 8, which is
+            the unconditioned bottleneck.
         spacing: world frame for the coordinate features injected per stage.
         bias_init: ``prior`` starts the head at the base rate of a single
             structure (see :func:`src.models.blocks.prior_logit`); ``zeros``
@@ -81,6 +85,7 @@ class RelationalDecoder(nn.Module):
         align_corners: bool = True,
         activation: str = "leaky_relu",
         condition_at: Sequence[int] = (16, 32),
+        occupancy_at: Sequence[int] = (16, 32, 64),
         out_channels: int = 1,
         coordinate_features: bool = True,
         spacing: Sequence[float] = (1.0, 1.0, 1.0),
@@ -95,10 +100,12 @@ class RelationalDecoder(nn.Module):
                 f"expected three skips and three decoder widths, got {skips} and {widths}"
             )
         self.condition_at = tuple(int(v) for v in condition_at)
+        self.occupancy_at = tuple(int(v) for v in occupancy_at)
         # Output resolution of each decoder stage, coarse to fine. Used to
         # decide which stages get FiLM; a stage that is never conditioned must
         # not own a FiLM block at all, or its parameters would sit in the
-        # optimiser forever without a gradient.
+        # optimiser forever without a gradient. Occupancy concat uses the same
+        # list so WHAT is never injected at an unknown scale.
         self.stage_resolutions = (
             tuple(int(v) for v in stage_resolutions) if stage_resolutions is not None else ()
         )
@@ -127,6 +134,17 @@ class RelationalDecoder(nn.Module):
         self.film = nn.ModuleDict(
             {str(index): FiLM3d(context_dim, widths[index]) for index in sorted(conditioned)}
         )
+        occupancy_stages = {
+            index
+            for index, resolution in enumerate(self.stage_resolutions)
+            if resolution in self.occupancy_at
+        }
+        self.occ_proj = nn.ModuleDict(
+            {
+                str(index): nn.Conv3d(widths[index] + 1, widths[index], kernel_size=1)
+                for index in sorted(occupancy_stages)
+            }
+        )
         if bias_init not in ("prior", "zeros"):
             raise ValueError(f"bias_init must be 'prior' or 'zeros', got {bias_init!r}")
         self.head = nn.Conv3d(widths[2], out_channels, kernel_size=1)
@@ -151,6 +169,7 @@ class RelationalDecoder(nn.Module):
         skips: Sequence[Tensor],
         context: Tensor,
         *,
+        occupancy: Tensor | None = None,
         full_shape: Sequence[int] | None = None,
     ) -> Tensor:
         """``-> [B, out_channels, D, H, W]`` target logits.
@@ -159,15 +178,32 @@ class RelationalDecoder(nn.Module):
             bottleneck: the intersection-conditioned ``[B, C, 8, 8, 8]`` grid.
             skips: encoder features at 1/4, 1/2 and full resolution.
             context: ``[B, context_dim]`` relation-fused clause context.
+            occupancy: full-resolution binary scene ``[B, 1, D, H, W]``. Max-
+                pooled onto each named decoder grid after the skip merge.
+                ``None`` skips the concat (ablation).
         """
         if len(skips) != 3:
             raise ValueError(f"expected three skip features, got {len(skips)}")
         shape = tuple(full_shape) if full_shape is not None else tuple(skips[-1].shape[2:])
+        if occupancy is not None:
+            if occupancy.ndim != 5 or occupancy.shape[1] != 1:
+                raise ValueError(
+                    f"occupancy must be [B, 1, D, H, W], got {tuple(occupancy.shape)}"
+                )
+            if occupancy.shape[0] != bottleneck.shape[0]:
+                raise ValueError(
+                    f"batch mismatch: occupancy {occupancy.shape[0]} vs bottleneck "
+                    f"{bottleneck.shape[0]}"
+                )
 
         features = bottleneck
         for index, (up, skip) in enumerate(zip((self.up1, self.up2, self.up3), skips)):
             features = up(self._with_coordinates(features, shape), skip)
             key = str(index)
+            if occupancy is not None and key in self.occ_proj:
+                occ = downsample_masks(occupancy, features.shape[2:], mode="max")
+                features = torch.cat([features, occ], dim=1)
+                features = self.occ_proj[key](features)
             if key in self.film:
                 film = self.film[key]
                 resolution = int(features.shape[-1])

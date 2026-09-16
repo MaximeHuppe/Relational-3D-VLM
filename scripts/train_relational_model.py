@@ -2,9 +2,9 @@
 """Phases 2-4: train and evaluate the Stage B relational target segmenter.
 
 One sample is one ``(scene, target)`` example: three ordered anchor-mask
-channels and a three-clause prompt go in, one target logit volume comes out. The
-target shape is never an input - the model has to find the region that satisfies
-all three relations at once.
+channels, a three-clause prompt and the binary scene occupancy go in, one
+target logit volume comes out. The target shape is never an input - the model
+has to find the region that satisfies all three relations at once.
 
 Phases
 ------
@@ -36,8 +36,9 @@ Both phases accept either anchor source, and it is the same model either way::
 
 With predicted anchors the run also reports the anchor masks' own Dice/IoU, so a
 drop against the oracle run can be attributed to Stage A rather than guessed at.
-The scene volume is read only to feed Stage A; Stage B still receives three mask
-channels and nothing else.
+The scene volume is loaded for every Stage B run: Stage A (predicted anchors)
+and the Stage B decoder (occupancy) are its two consumers. Instance labels
+never reach Stage B.
 
 Examples::
 
@@ -207,13 +208,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     data_root = resolve_data_root(args)
     settings = build_settings(args)
     anchor_source = args.anchor_source or settings.anchor_source
-    needs_scene_volume = anchor_source == "predicted"
+    needs_scene_volume = True
     suffix = "_smoke" if args.smoke else ""
     output_dir = args.output or (PROJECT_ROOT / f"runs/stage_b_{args.phase}{suffix}")
     log_cfg = logging_config(
         extra_tags=[
             f"stage_b_{args.phase}",
             f"anchors_{anchor_source}",
+            "occupancy-decoder",
             "smoke" if args.smoke else "",
             args.variant or "",
         ]

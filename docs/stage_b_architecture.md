@@ -1,10 +1,11 @@
 # Stage B architecture
 
 Phases 2-4 of the training procedure: the **relational target segmenter**. It
-takes three ordered binary anchor-mask channels and a three-clause prompt, and
-returns one target logit volume. The target shape is never an input — the model
-has to find the region that satisfies all three target-relative constraints at
-once.
+takes three ordered binary anchor-mask channels, a three-clause prompt and the
+binary scene occupancy, and returns one target logit volume. The target shape
+is never an input — the model has to find the region that satisfies all three
+target-relative constraints at once. Occupancy tells it which voxels sit at
+that place; it does not name the target.
 
 Source: `src/models/relational_vlm.py` and the six modules it composes
 (`relational_encoder`, `structure_encoder`, `prompt_encoder`,
@@ -15,15 +16,48 @@ Figure: `docs/flowchart/phase2_model.drawio` (Architecture + Training-Data-Eval)
 ## What the model may see
 
 ```python
-model(anchor_masks, direction_ids, anchor_shape_ids)   # and nothing else
+model(anchor_masks, direction_ids, anchor_shape_ids, scene_volume)
 ```
 
-The forward signature is the contract. `scene_volume`, `instance_labels`,
-`target_mask`, `target_shape_name`, `target_instance_id` and
-`target_centroid_world` — `src.data.schema.STAGE_B_FORBIDDEN_FIELDS` — have
-nowhere to go. The training loop's only model call goes through
-`src.data.dataset.stage_b_model_inputs`, which returns exactly those three
-tensors; `tests/test_stage_b_contract.py` pins both ends down.
+The forward signature is the contract. `instance_labels`, `target_mask`,
+`target_shape_name`, `target_instance_id` and `target_centroid_world` —
+`src.data.schema.STAGE_B_FORBIDDEN_FIELDS` — have nowhere to go.
+`scene_volume` is occupancy: binary foreground of all ten shapes, no instance
+ids, no target highlight. The training loop's only model call goes through
+`src.data.dataset.stage_b_model_inputs`, which returns those four tensors;
+`tests/test_stage_b_contract.py` pins both ends down.
+
+## WHERE / WHAT
+
+Relations say *where* the target is. Only the scene occupancy can say *which
+voxels* that object occupies.
+
+```text
+anchor_masks [B, 3, 64, 64, 64]          scene_volume [B, 1, 64, 64, 64]
+        │ WHERE                                     │ WHAT
+        ▼                                           ▼
+  RelationalEncoder (unchanged:                    occupancy = scene
+    3 ordered anchors + XYZ)                       occupancy *= (1 - union(anchors))
+        │                                          downsample with max-pool
+        │                                          to 16³, 32³, 64³
+  fusion / intersection on the 8³                  │
+  bottleneck                                       │
+        │                                          │
+        └──────────────► RelationalDecoder ◄───────┘
+                         concat occupancy at 16³, 32³, 64³
+                         (after skip merge, before FiLM/refine)
+                         head unchanged
+                         logits [B, 1, 64, 64, 64]
+```
+
+Occupancy is a decoder skip of one channel, not an encoder input. Concatenating
+it into the relational encoder would let grounding queries see the target's
+own voxels; WHERE and WHAT would collapse into one stream. Do not inject at
+8³: that would put WHAT on the unconditioned bottleneck.
+
+By default the three anchor voxels are zeroed before the decoder sees occupancy
+(`occupancy = scene * (1 - union(anchors))`). WHAT is then "the other seven
+objects" and the landmarks are not duplicated.
 
 ## Pipeline
 
@@ -49,14 +83,21 @@ per clause i (weights shared across i):
 IntersectionFusion([H_1, H_2, H_3, sigmoid(H_1)*sigmoid(H_2)*sigmoid(H_3)])
   1x1 conv -> hidden -> 1x1 conv -> C4,  added to the bottleneck
 
+scene_volume [B, 1, 64, 64, 64]
+  occupancy = scene * (1 - union of the three anchor channels)
+  max-pooled to 16³ / 32³ / 64³
+
 RelationalDecoder  8^3 -> 16^3 -> 32^3 -> 64^3
-  upsample, concat encoder skip, FiLM(context) at 16^3 and 32^3, 3D conv refine
+  upsample, concat encoder skip, concat occupancy (WHAT), FiLM(context) at
+  16^3 and 32^3, 3D conv refine
   head (1x1) -> target logits [B, 1, 64, 64, 64]
 ```
 
 `context` is the three fused clause tokens concatenated **in clause order**
 (`[B, 3E]`). Pooling happens only here, after every clause has produced its own
-spatial map — never before grounding.
+spatial map — never before grounding. Structure tokens are still pooled from
+the **anchor** bottleneck, never from occupancy. Evidence maps are still
+computed from the **anchor** encoder's 8³ grid.
 
 ## Design decisions
 
@@ -139,7 +180,8 @@ convolution before they can observe any input sensitivity.
 back already aligned with the clauses. The predicted provider also scores its
 own output against the ground-truth channels (`anchor_dice`, `anchor_iou`,
 `empty_anchor_fraction`) so a Stage B drop can be attributed rather than guessed
-at. The scene volume goes into Stage A and stops there.
+at. The same `scene_volume` goes into Stage A (anchors) and Stage B (occupancy).
+It still must not become `instance_labels`.
 
 ## Baseline variants
 

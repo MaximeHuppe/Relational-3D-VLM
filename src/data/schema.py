@@ -29,7 +29,9 @@ rather than hidden. See ``docs/dataset_schema.md``.
 Stage B contract
 ----------------
 :data:`STAGE_B_FORBIDDEN_FIELDS` names the fields the relational model must
-never see. :func:`stage_b_inputs` returns only the permitted subset.
+never see: instance ids and every ``target_*`` field. Binary ``scene_volume``
+(occupancy, no instance colours) is allowed as the decoder-side WHAT stream.
+:func:`stage_b_inputs` returns only the permitted subset.
 """
 
 from __future__ import annotations
@@ -91,9 +93,9 @@ VERSION_FIELDS: tuple[str, ...] = (
     "schema_version",
 )
 
-#: Stage B must never receive these, in any form.
+#: Stage B must never receive these, in any form. Occupancy (``scene_volume``)
+#: is allowed; instance ids and every target identity field are not.
 STAGE_B_FORBIDDEN_FIELDS: tuple[str, ...] = (
-    "scene_volume",
     "instance_labels",
     "target_mask",
     "target_shape_name",
@@ -107,6 +109,7 @@ STAGE_B_ABLATION_ONLY_FIELDS: tuple[str, ...] = ("anchor_union_mask",)
 #: What the relational model is allowed to consume.
 STAGE_B_ALLOWED_FIELDS: tuple[str, ...] = (
     "anchor_masks",
+    "scene_volume",
     "structured_prompt",
     "prompt",
     "anchor_shape_names",

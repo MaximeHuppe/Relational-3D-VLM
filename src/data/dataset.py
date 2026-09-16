@@ -8,10 +8,10 @@ supervised on, while Stage A must learn all ten shapes in every split - so
 that split's manifest.
 
 Stage B consumes *examples*: one sample is one ``(scene, target)`` pair - three
-ordered anchor channels, a three-clause prompt and the target mask that
-supervises it - read from the same manifests. :class:`ExampleDataset` is filtered
-by ``configs/split.yaml`` at generation time, so it yields only the target
-classes a split is allowed to supervise.
+ordered anchor channels, a three-clause prompt, the binary scene occupancy, and
+the target mask that supervises it - read from the same manifests.
+:class:`ExampleDataset` is filtered by ``configs/split.yaml`` at generation time,
+so it yields only the target classes a split is allowed to supervise.
 
 Augmentation
 ------------
@@ -313,19 +313,18 @@ class ExampleDataset(Dataset):
     ``anchor_shape_ids``   ``[3]`` int64, zero-based shape indices - these double
                            as Stage A's ``prompt_ids`` when anchors are predicted;
     ``anchor_union_mask``  ``[1, D, H, W]`` float32, ablation baseline only;
-    ``scene_volume``       ``[1, D, H, W]`` float32, **only** when
-                           ``include_scene_volume=True``;
+    ``scene_volume``       ``[1, D, H, W]`` float32, binary occupancy of the
+                           whole scene. Always present by default. Stage A
+                           consumes it to predict anchors; Stage B's decoder
+                           consumes the same tensor as the WHAT stream.
     plus ``example_id``, ``scene_id``, ``prompt``, ``target_shape_name``,
     ``anchor_shape_names``, ``directions`` and ``rotation`` for reporting and
     stratification.
 
     The target mask is the label, never an input: :func:`stage_b_model_inputs`
     is the only sanctioned way to build the model's arguments from an item, and
-    it passes exactly the anchor channels and the two index tensors.
-
-    ``scene_volume`` is off by default and exists for one purpose: feeding
-    Stage A when anchors are *predicted* (Phase 4). It goes to the anchor
-    provider, never to Stage B - see :mod:`src.models.anchor_provider`.
+    it passes the anchor channels, the two index tensors and ``scene_volume``.
+    Instance labels and every ``target_*`` field stay behind.
 
     Args:
         root: dataset directory written by ``scripts/generate_dataset.py``.
@@ -334,7 +333,9 @@ class ExampleDataset(Dataset):
         scene_ids: restrict to these scenes (Phase 2 overfits on one).
         target_shapes: restrict to these target classes; the manifest is already
             filtered by ``configs/split.yaml``, so this is a further narrowing.
-        include_scene_volume: also return the scene volume, for predicted anchors.
+        include_scene_volume: return the binary scene occupancy. On by default
+            because Stage B's decoder needs it; predicted-anchor runs also
+            feed the same tensor to Stage A.
         validate: re-run the full schema validation on the first visit to each
             scene. Cheap (once per scene) and fails fast on a corrupt corpus.
         cache: hold decoded ``instance_labels`` in memory, one copy per scene
@@ -357,7 +358,7 @@ class ExampleDataset(Dataset):
         limit: int | None = None,
         scene_ids: Sequence[str] | None = None,
         target_shapes: Sequence[str] | None = None,
-        include_scene_volume: bool = False,
+        include_scene_volume: bool = True,
         validate: bool = True,
         cache: bool = True,
         augment: "RotationAugmentation | None" = None,
@@ -493,7 +494,6 @@ class ExampleDataset(Dataset):
 #: Keys of a Stage B item that are labels or provenance, never model inputs.
 STAGE_B_NON_INPUT_KEYS: tuple[str, ...] = (
     "target_mask",
-    "scene_volume",
     "anchor_union_mask",
     "example_id",
     "scene_id",
@@ -510,7 +510,7 @@ def stage_b_model_inputs(
 ) -> dict[str, torch.Tensor]:
     """The only sanctioned way to call Stage B from a batch.
 
-    Returns exactly ``{anchor_masks, direction_ids, anchor_shape_ids}``.
+    Returns exactly ``{anchor_masks, direction_ids, anchor_shape_ids, scene_volume}``.
     ``anchor_masks`` may be overridden with predicted channels; everything else
     in the batch - the target mask above all - stays behind.
     """
@@ -519,6 +519,7 @@ def stage_b_model_inputs(
         "anchor_masks": masks,
         "direction_ids": batch["direction_ids"],
         "anchor_shape_ids": batch["anchor_shape_ids"],
+        "scene_volume": batch["scene_volume"],
     }
 
 

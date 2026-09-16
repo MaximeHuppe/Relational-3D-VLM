@@ -20,7 +20,7 @@ The project must remain useful for a later MRI setting in which anchor masks are
 - Shapes must be fully contained and must not overlap.
 - Shapes use one foreground intensity on a zero background. No MRI appearance model is required in this milestone.
 - Shapes are axis-aligned in the first version. Do not introduce rotations until a later experiment.
-- The relational model receives only three ordered anchor-mask channels and the prompt representation. It must not receive the complete scene volume, target mask, target class, target centroid, or target instance ID.
+- The relational model receives three ordered anchor-mask channels, the prompt representation, geometry derived from those masks, and the binary scene occupancy. It must not receive instance labels, the target mask, the target class, the target centroid, or the target instance ID.
 - Anchor channels must remain separate. A union of the three anchor masks is allowed only for an ablation baseline, never as the main representation.
 - The three prompt directions must always be different.
 - All random operations must use explicit, saved seeds.
@@ -184,7 +184,7 @@ Stage A must be evaluated independently with per-class Dice and IoU. Save its ch
 
 ### Stage B: relational target segmenter
 
-Stage B receives exactly three ordered binary anchor-mask channels, the structured three-clause prompt (or equivalent closed-vocabulary embedding), and geometry features derived from those masks. It does not receive the complete scene, target class, target mask, or target coordinates.
+Stage B receives exactly three ordered binary anchor-mask channels, the structured three-clause prompt (or equivalent closed-vocabulary embedding), geometry features derived from those masks, and the binary scene occupancy. Occupancy is a decoder-side WHAT stream: the encoder never sees it. Still forbidden: instance labels, target mask, target class, target centroid, target instance id.
 
 Use a 3D encoder-decoder with skip connections:
 
@@ -230,7 +230,7 @@ Use bottleneck visual locations as queries and relation/structure tokens as keys
 
 Add continuous normalized world-coordinate features `(x, y, z)` to visual features at every scale. Recompute them correctly after resizing or cropping; local tensor indices are insufficient. Add centroid, extent, volume, and slot embeddings to each anchor token.
 
-At each decoder stage, upsample, fuse the matching encoder skip feature, inject relation-fused context, and apply 3D convolutional refinement. The final head returns one target logit volume. During evaluation, also return sigmoid probabilities and a thresholded binary mask.
+At each decoder stage, upsample, fuse the matching encoder skip feature, concatenate the occupancy channel at 16³, 32³ and 64³, inject relation-fused context, and apply 3D convolutional refinement. The final head returns one target logit volume. During evaluation, also return sigmoid probabilities and a thresholded binary mask.
 
 ## Training procedure
 

@@ -322,9 +322,10 @@ def test_validate_example_runs_the_full_contract():
 # ---------------------------------------------------------------------------
 # Stage B input contract
 # ---------------------------------------------------------------------------
-def test_stage_b_never_receives_the_scene_or_anything_about_the_target():
+def test_stage_b_receives_occupancy_but_never_the_target():
     inputs = stage_b_inputs(build_example())
     assert set(inputs) == set(STAGE_B_ALLOWED_FIELDS)
+    assert "scene_volume" in inputs
     for forbidden in STAGE_B_FORBIDDEN_FIELDS:
         assert forbidden not in inputs
     assert inputs["anchor_masks"].shape == (NUM_ANCHORS,) + SHAPE

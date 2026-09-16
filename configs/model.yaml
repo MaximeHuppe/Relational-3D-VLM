@@ -73,10 +73,11 @@ stage_a:
   eval_metrics: [dice, iou]       # reported per class
 
 stage_b:
-  # Relational target segmenter. Inputs are ONLY the three ordered anchor-mask
-  # channels, the structured prompt and geometry features derived from those
-  # masks. It never receives scene_volume, instance_labels, target_mask,
-  # target class, target centroid or target instance ID.
+  # Relational target segmenter. Inputs are the three ordered anchor-mask
+  # channels, the structured prompt, geometry features derived from those
+  # masks, and the binary scene occupancy (decoder-side WHAT stream).
+  # It never receives instance_labels, target_mask, target class, target
+  # centroid or target instance ID. Occupancy is not an encoder input.
   name: relational_vlm
   in_channels: 3                  # ordered anchor masks, one per clause slot
   out_channels: 1                 # single target logit volume at input resolution
@@ -86,6 +87,12 @@ stage_b:
   decoder_channels: [128, 64, 32]
   norm: instance
   activation: leaky_relu
+  occupancy:
+    enabled: true                # the WHAT stream
+    mask_anchors: true           # occupancy *= (1 - union of the 3 channels)
+    inject_at_resolutions: [16, 32, 64]
+    # Do not inject at 8³: that would put WHAT on the unconditioned bottleneck
+    # and undo the WHERE/WHAT split.
 
   position_features:
     # Continuous normalised world coordinates (x, y, z) concatenated at every

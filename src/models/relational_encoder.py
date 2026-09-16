@@ -5,9 +5,11 @@ tokens, which is what makes global cross-attention affordable; full-resolution
 attention over 262,144 tokens is explicitly forbidden by CLAUDE.md and never
 happens here.
 
-The encoder sees *only* the anchor channels. There is no scene volume, no
-instance labels and no target mask anywhere in this file - the target is not an
-input to be encoded, it is the region the relations intersect.
+This module is the WHERE encoder. It sees *only* the ordered anchor channels
+plus world XYZ. Occupancy, instance labels and the target mask must not be
+concatenated here: grounding queries that could see the target's own voxels
+would let the model ignore the prompt and pick "a blob that is not an anchor."
+The binary scene is a decoder-side WHAT stream instead.
 
 Normalised world coordinates ``(x, y, z)`` are concatenated to the features at
 every scale (64, 32, 16, 8), recomputed from the world frame at each resolution
