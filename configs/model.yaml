@@ -1,0 +1,173 @@
+# Model architecture contract (Phases 1-4 implementation; shapes fixed here).
+
+model_version: "1.1.0"   # 1.1.0: Stage B implemented (Phases 2-4)
+
+stage_a:
+  # Full-volume promptable shape segmenter: the synthetic analogue of the future
+  # MRI anatomy segmenter that will supply anchor masks.
+  #
+  # Architecture documented in docs/flowchart/phase1_encoder_decoder.drawio
+  # (adapted from VoxDense), with the changes listed in
+  # docs/stage_a_architecture.md:
+  #   1. the patch is 64^3 instead of 128^3, so the three stride-2 stages give
+  #      64 -> 32 -> 16 -> 8 and the bottleneck grid is 8^3 (512 tokens), which
+  #      is exactly the budget CLAUDE.md sets for global cross-attention;
+  #   2. the frozen PubMedBERT name embeddings are replaced by this project's
+  #      closed-vocabulary shape-name embedding table. The vocabulary is fixed
+  #      at ten names, so a learned table is the deterministic equivalent and
+  #      keeps the text path free of synonyms.
+  name: voxdense_shape_segmenter
+  in_channels: 1                  # binary scene_volume
+  num_prompts: 10                 # one mask logit per requested shape name
+  stem_channels: 32
+  encoder_channels: [32, 64, 128, 256]
+  strides: [2, 2, 2]              # stem is stride 1
+  resblocks: [1, 1, 1]
+  kernel_size: 3
+  resolutions: [64, 32, 16, 8]    # stem, stage 1, stage 2, bottleneck
+  bottleneck_resolution: 8
+  decoder_channels: [128, 64, 32] # 256+128->128, 128+64->64, 64+32->32
+  norm: instance                  # InstanceNorm3d(affine=False)
+  activation: relu
+  upsample: trilinear             # no transposed convolutions
+  align_corners: true
+
+  prompt_encoder:
+    # Closed vocabulary; replaces the frozen language model of the reference.
+    type: closed_vocabulary_shape_names
+    num_shapes: 10
+    text_dim: 256                 # learned name-embedding width
+    embed_dim: 256                # query width into the prompt decoder
+
+  prompt_decoder:
+    # Text queries attend over the flattened bottleneck. The asymmetry is
+    # intentional: Q carries no positional encoding (what), K carries it
+    # (where), V is the unmodified visual grid.
+    heads: 4
+    head_dim: 64                  # heads * head_dim must equal embed_dim
+    positional_encoding: decomposed_3d
+    positional_encoding_on: keys
+    residual_norm: layer_norm
+
+  fusion:
+    # Per-prompt scaled dot product plus a per-query logit bias. Visual features
+    # are never modulated, so adding prompts cannot change the logits of a
+    # shared subset.
+    type: scaled_dot_product_mask_head
+    per_query_bias: true
+    # The reference figure zero-initialises this bias, which starts every voxel
+    # at p = 0.5. One shape covers ~0.16% of a 64^3 scene, so that costs about
+    # an order of magnitude in convergence here (measured: train Dice 0.18 vs
+    # 0.66 after the same 150 steps). `prior` initialises the bias to
+    # log(p/(1-p)) instead - the standard focal-loss prior - and leaves it
+    # learnable. Set to `zeros` to reproduce the reference exactly.
+    bias_init: prior
+    prior_foreground_fraction: 0.0016   # measured mean per-class occupancy
+
+  deep_supervision:
+    resolutions: [16, 32, 64]
+    weights: [0.1, 0.3, 0.6]
+    target_downsampling: max_pool  # presence-preserving for thin structures
+    inference_output: full_resolution
+
+  eval_metrics: [dice, iou]       # reported per class
+
+stage_b:
+  # Relational target segmenter. Inputs are ONLY the three ordered anchor-mask
+  # channels, the structured prompt and geometry features derived from those
+  # masks. It never receives scene_volume, instance_labels, target_mask,
+  # target class, target centroid or target instance ID.
+  name: relational_vlm
+  in_channels: 3                  # ordered anchor masks, one per clause slot
+  out_channels: 1                 # single target logit volume at input resolution
+  encoder_channels: [32, 64, 128, 256]
+  resolutions: [64, 32, 16, 8]    # bottleneck 8^3 = 512 spatial tokens
+  bottleneck_resolution: 8
+  decoder_channels: [128, 64, 32]
+  norm: instance
+  activation: leaky_relu
+
+  position_features:
+    # Continuous normalised world coordinates (x, y, z) concatenated at every
+    # scale. Recomputed from world geometry after any resize or crop; local
+    # tensor indices are not sufficient.
+    type: normalized_world_xyz
+    inject_at_resolutions: [64, 32, 16, 8]
+
+  structure_encoder:
+    # One token per anchor channel; the three tokens are never pooled together.
+    per_anchor_features:
+      - masked_pooled_encoder_features
+      - normalized_world_centroid
+      - normalized_bbox_extent
+      - normalized_voxel_volume
+    slot_embedding: true          # slots 1-3
+    shape_embedding: true         # ten shape names
+    token_dim: 256
+
+  prompt_encoder:
+    # Closed vocabulary; the natural-language path maps deterministically to
+    # the same three clause tokens.
+    type: closed_vocabulary
+    embedding_dim: 256
+    num_directions: 6
+    num_shapes: 10
+    num_slots: 3
+    pair_embedding: true          # (direction, anchor_shape) -> 60 pairs
+    # relation_token_i = direction_emb + shape_emb + pair_emb + slot_emb
+    pool_clauses: false           # all three clauses preserved before grounding
+
+  fusion:
+    # Three independent relation-conditioned branches, then explicit intersection.
+    branch_fusion: cross_attention   # alternative: gated_mlp
+    num_heads: 4
+    attention_resolution: 8          # bottleneck queries, relation/structure tokens as keys/values
+    forbid_full_resolution_attention: true
+    intersection:
+      inputs: [H1, H2, H3, H1_mul_H2_mul_H3]
+      module: pointwise_fusion_block
+      hidden_channels: 256
+    decoder_conditioning:
+      type: film                     # lightweight FiLM / gating
+      at_resolutions: [16, 32]
+
+  output:
+    return_logits: true
+    return_probabilities: true       # sigmoid, at evaluation time
+    return_binary_mask: true
+    binary_threshold: 0.5
+    # Same prior-initialised mask head as Stage A: one target covers ~0.16% of
+    # the volume, so a zero-init head (p = 0.5 everywhere) spends the start of
+    # training pushing background logits down instead of learning where the
+    # target is. Set to `zeros` to disable.
+    bias_init: prior
+    prior_foreground_fraction: 0.0016
+
+# Reduced configuration for CPU/MPS smoke runs.
+smoke:
+  stage_a:
+    stem_channels: 8
+    encoder_channels: [8, 16, 32, 64]
+    decoder_channels: [32, 16, 8]
+    prompt_encoder: {text_dim: 64, embed_dim: 64}
+    prompt_decoder: {heads: 2, head_dim: 32}
+  stage_b:
+    encoder_channels: [8, 16, 32, 64]
+    decoder_channels: [32, 16, 8]
+    structure_encoder: {token_dim: 64}
+    prompt_encoder: {embedding_dim: 64}
+    fusion: {num_heads: 2, intersection: {hidden_channels: 64}}
+
+baselines:
+  # Mandatory ablations. Only `full` is the main representation.
+  - name: anchor_masks_only
+    use_prompt: false
+    anchor_representation: ordered_channels
+  - name: prompt_only
+    use_anchor_masks: false
+    use_coordinates: true
+  - name: prompt_plus_union_mask
+    anchor_representation: union_mask     # ablation baseline only
+  - name: full
+    anchor_representation: ordered_channels
+    use_prompt: true

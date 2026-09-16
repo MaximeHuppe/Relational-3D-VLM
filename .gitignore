@@ -1,0 +1,29 @@
+# Generated volumes are large: keep them out of git.
+# Only manifests, schemas, configs and small fixtures are committed.
+data/raw/
+data/processed/
+data/smoke/
+data/**/*.npz
+data/**/*.npy
+data/**/*.nii
+data/**/*.nii.gz
+!data/fixtures/
+runs/
+checkpoints/
+outputs/
+wandb/
+
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+.DS_Store
+.idea/
+.vscode/

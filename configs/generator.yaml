@@ -1,0 +1,95 @@
+# Synthetic scene generation (Phase 1 implementation; contract fixed here).
+
+generator_version: "1.0.0"
+direction_rule_version: "1.0.0"   # must match src.data.direction_rules.DIRECTION_RULE_VERSION
+schema_version: "1.0.0"           # must match src.data.schema.SCHEMA_VERSION
+vocabulary_version: "1.0.0"       # must match configs/shapes.yaml
+
+geometry:
+  volume_shape: [64, 64, 64]      # (D, H, W) == array order (z, y, x)
+  spacing: [1.0, 1.0, 1.0]        # world units per voxel, ordered (x, y, z)
+  coordinate_frame: RAS           # x right/lateral, y anterior, z superior
+  in_bounds_margin_voxels: 2      # every object must stay this far from the border
+  foreground_value: 1
+  background_value: 0
+
+packing:
+  shapes_per_scene: 10            # exactly one instance of each class
+  allow_overlap: false
+  min_separation_voxels: 0        # non-overlap is the only separation requirement
+  max_object_attempts: 200        # per-object rejection sampling budget
+  max_scene_attempts: 50          # full-scene restarts before escalating the grid
+  # If packing still fails, grow all three axes together and record the actual
+  # volume_shape in the example. The output/crop contract stays explicit: the
+  # model always predicts at the recorded volume_shape.
+  escalation_volume_shapes:
+    - [72, 72, 72]
+    - [80, 80, 80]
+  rescale_size_ranges_on_escalation: true
+
+anchors:
+  num_anchors: 3
+  require_distinct_directions: true
+  # Nearest-feasible selection: rank all nine candidates by Euclidean centroid
+  # distance (instance ID as tie-break), scan in order, keep a candidate only if
+  # its target-relative direction is unused, stop at three.
+  ranking: euclidean_centroid_distance
+  ranking_tie_break: instance_id
+  anchor_order: ascending_distance          # identical in text, structured prompt and mask channels
+  on_no_feasible_triplet: regenerate_scene
+  store_anchor_union_mask: true             # ablation baseline input only, never the main representation
+
+examples:
+  # One prompt-target example per instance: 10 candidate examples per scene,
+  # before the target-class split filter is applied.
+  examples_per_scene: 10
+
+storage:
+  root: data/processed
+  # Scene arrays (scene_volume, instance_labels) are written once per scene;
+  # example records reference their scene and carry all metadata. Masks are
+  # materialised deterministically from instance_labels on load, and the loader
+  # re-runs the channel/order consistency checks. See docs/dataset_schema.md.
+  scene_array_format: npz_compressed
+  example_manifest_format: jsonl
+  # Manifests hold only the examples retained by the target-class filter.
+  # --keep-all-candidates additionally writes <split>_candidates.jsonl with all
+  # ten candidates per scene; the smoke run uses it for coverage checks.
+
+validation:
+  # Fail fast; never silently repair. Each flag is a hard assertion.
+  require_exactly_ten_instances: true
+  reject_empty_object: true
+  reject_out_of_bounds: true
+  reject_overlap: true
+  reject_target_in_anchor_channel: true
+  reject_channel_anchor_mismatch: true
+  reject_anchor_order_mismatch: true
+  require_prompt_round_trip: true
+  log_rejection_reasons: true
+  log_acceptance_rate: true
+
+seeds:
+  # Scene seeds are disjoint across splits; see configs/split.yaml for the
+  # per-split ranges. Every random draw derives from the scene seed.
+  master_seed: 20260915
+  seed_namespace: "relational3d-vlm/v1"
+
+# Small end-to-end run used to verify the pipeline before the full corpus:
+#   .venv/bin/python scripts/generate_dataset.py --smoke
+#   .venv/bin/python scripts/run_smoke_test.py
+# Its seed ranges are disjoint from every split in configs/split.yaml, so a
+# smoke scene can never leak into the real corpus.
+smoke:
+  output_root: data/smoke
+  scenes:
+    train: 16
+    val: 4
+    test: 4
+  scene_seed_ranges:
+    train: [9000000, 9000016]
+    val: [9100000, 9100004]
+    test: [9200000, 9200004]
+  # Keep all ten candidates per scene so the inspected batch can cover every
+  # shape as a target, every shape as an anchor and all six directions.
+  keep_all_candidates: true

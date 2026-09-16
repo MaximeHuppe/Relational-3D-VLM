@@ -1,0 +1,196 @@
+# Training procedure (Phases 1-4 implementation; hyperparameters fixed here).
+# Phase 0 runs no training.
+
+train_version: "1.1.0"   # 1.1.0: Stage B (Phases 2-4) schedules and anchor sources
+
+common:
+  seed: 20260915
+  deterministic: true
+  log_every_steps: 20
+  checkpoint_metric: dice
+  checkpoint_mode: max
+  save_metadata:
+    - config
+    - seeds
+    - generator_version
+    - direction_rule_version
+    - vocabulary_version
+    - schema_version
+    - git_revision
+    - hardware
+    - checkpoint_metadata
+
+# Experiment tracking. Backend ``wandb`` mirrors per-epoch train/val losses and
+# metrics to Weights & Biases (and still writes runs/<name>/metrics.jsonl).
+# Set backend to ``none`` to disable W&B without changing the rest of the loop.
+logging:
+  backend: wandb
+  wandb:
+    project: relational-3d-vlm
+    tags: [relational-3d-vlm]
+
+hardware_profiles:
+  laptop_mps:
+    device: mps
+    batch_size: 4
+    # Effective batch = batch_size * gradient_accumulation_steps = 16. The
+    # stage_a learning rate below was chosen for an effective batch of 4, so
+    # raising this raises the gradient signal-to-noise per step: scale the
+    # learning rate with it, or lower the accumulation factor.
+    gradient_accumulation_steps: 4
+    # Measured on the 8.02M-parameter Stage A model at 64^3, 17 GB Apple
+    # Silicon. All arms interleaved in one process, median of 6 steps:
+    #
+    #   batch  fp32 ms/sample  bf16 ms/sample  bf16 speedup  driver memory
+    #       1             666             576         1.15x        2.28 GB
+    #       2             668             539         1.24x        3.39 GB
+    #       4             851             573         1.48x        5.60 GB
+    #       8            1475             600         2.46x       10.05 GB
+    #
+    # Read it this way:
+    #   * bf16 always wins, and wins by more as the batch grows, because fp32
+    #     runs into memory pressure sooner. At batch 8, fp32 is 2.5x slower.
+    #   * bf16 per-sample throughput is FLAT in batch size (539-600 ms). A
+    #     bigger batch buys a bigger effective batch, not speed.
+    #   * autocast does NOT save memory on MPS - the cast copies sit on top of
+    #     the fp32 masters, so a given batch costs more in bf16 than in fp32.
+    #     (On CUDA the opposite holds.)
+    #   * memory is linear in batch size. Batch 8 at ~10 GB of 17 GB is close
+    #     enough to the edge that one fp32 run degraded to 49 s/step.
+    #
+    # Timings on a shared laptop vary by ~20% run to run; re-measure before
+    # trusting these on other hardware.
+    # bf16, not fp16: fp16 leaves 3.2% of gradient elements exactly zero against
+    # 0.5% for fp32 (measured, one backward at batch 2). fp16 is still usable -
+    # the trainer enables a GradScaler for it automatically - but bf16 needs no
+    # scaler and matches fp32 gradients to three digits.
+    precision: bf16
+    # The data pipeline costs ~1 ms/sample against ~550 ms of compute, so worker
+    # count does not affect throughput; 0 is simplest, >0 costs a one-off ~0.6 s
+    # spawn. Each persistent worker holds its own scene cache (~0.5 MB/scene).
+    num_workers: 2
+    # Hardware profile and model width are independent: the laptop can train the
+    # full model, just slowly. The reduced model is selected by the per-stage
+    # `smoke` block (scripts/*.py --smoke), not by the device.
+    model_profile: default
+  rtx5090:
+    device: cuda
+    # Not measured on this hardware. On CUDA, unlike MPS, bf16 autocast does cut
+    # activation memory and does use the tensor cores, so raising batch_size
+    # should pay off there - tune it on the real device.
+    batch_size: 8
+    gradient_accumulation_steps: 1
+    precision: bf16
+    num_workers: 8
+    model_profile: default
+
+# Phase 1: Stage A pretraining on all ten shapes.
+stage_a:
+  epochs: 60
+  optimizer: {name: adamw, lr: 0.001, weight_decay: 0.00001}
+  scheduler: {name: cosine, warmup_epochs: 2}
+  loss:
+    # CLAUDE.md asks for "multiclass cross-entropy plus Dice loss, or a
+    # documented equivalent". The equivalent used here is per-prompt sigmoid
+    # Dice + BCE summed over the deep-supervision scales, because the Stage A
+    # head is promptable: it emits one independent mask logit per requested
+    # shape name instead of a softmax over a fixed class axis. That
+    # independence is what lets Phase 4 query only the three named anchors.
+    # See src/training/losses.py and docs/stage_a_architecture.md.
+    lambda_dice: 1.0
+    lambda_bce: 1.0
+  threshold: 0.5
+  # Selection and reporting metric. One sample is a whole scene, so the target
+  # split filter does not apply: Stage A learns all ten shapes in every split.
+  selection_metric: val_mean_dice
+  gate: "all ten classes must reach a documented per-class Dice floor before predicted anchors are used"
+  # Fast end-to-end check of the training loop on the smoke corpus.
+  smoke:
+    epochs: 40
+    optimizer: {name: adamw, lr: 0.002, weight_decay: 0.0}
+    scheduler: {name: cosine, warmup_epochs: 1}
+    hardware: {batch_size: 2, gradient_accumulation_steps: 1, model_profile: smoke}
+
+# Phase 2: relational overfit on a single scene (bug catcher).
+# One scene contributes every example whose target class the split allows, so
+# this trains on a handful of prompts that share one geometry. It is not a
+# result - it is the test that channel order, coordinates, prompt indices and
+# the decoder are wired together correctly, and it must reach
+# `target_train_dice` before Phase 3 is worth starting.
+stage_b_overfit:
+  scenes: 1
+  steps: 2000
+  optimizer: {name: adamw, lr: 0.001, weight_decay: 0.0}
+  scheduler: {name: constant, warmup_epochs: 0}
+  loss: {lambda_dice: 1.0, lambda_bce: 1.0}
+  threshold: 0.5
+  target_train_dice: 0.95
+  # Either anchor source can be overfit; oracle is the default because a Phase 2
+  # failure should mean "Stage B is wired wrong", not "Stage A is still weak".
+  anchor_source: oracle
+  smoke:
+    steps: 150
+    hardware: {batch_size: 2, gradient_accumulation_steps: 1, model_profile: smoke}
+
+# Phase 3: oracle-anchor training - the primary proof-of-concept measurement.
+stage_b_oracle:
+  epochs: 100
+  optimizer: {name: adamw, lr: 0.0003, weight_decay: 0.00001}
+  scheduler: {name: cosine, warmup_epochs: 5}
+  loss:
+    # L = lambda_dice * DiceLoss + lambda_bce * BCEWithLogitsLoss
+    lambda_dice: 1.0
+    lambda_bce: 1.0
+    # No target-shape classification loss in this milestone.
+  threshold: 0.5
+  # Validation targets are the two held-out classes, so this metric measures
+  # compositional transfer, not fit.
+  selection_metric: val_dice
+  anchor_source: oracle
+  smoke:
+    epochs: 6
+    optimizer: {name: adamw, lr: 0.001, weight_decay: 0.0}
+    scheduler: {name: cosine, warmup_epochs: 1}
+    hardware: {batch_size: 2, gradient_accumulation_steps: 1, model_profile: smoke}
+
+# Phase 4: predicted-anchor evaluation (no retraining).
+# The trained Stage B checkpoint is re-run with `--anchor-source predicted`,
+# which puts Stage A's masks for the three named anchors in place of the
+# ground-truth ones. Identical model, identical weights, different anchors.
+stage_b_predicted:
+  anchor_source: stage_a_prediction
+  stage_a_checkpoint: runs/stage_a/best.pt
+  threshold: 0.5
+  report_delta_vs_oracle: true
+
+augmentations:
+  # Relation-preserving only. An augmentation stays disabled until its relation
+  # rewrite (masks, world coordinates, centroids/extents, direction labels,
+  # prompt clauses) has a passing unit test.
+  enabled: false
+  flip_x: {enabled: false, rewrite_tested: false}
+  flip_y: {enabled: false, rewrite_tested: false}
+  flip_z: {enabled: false, rewrite_tested: false}
+  translate: {enabled: false, rewrite_tested: false}
+  crop: {enabled: false, rewrite_tested: false}
+  axis_permutation: {enabled: false, rewrite_tested: false}
+  arbitrary_rotation: {enabled: false, allowed_in_milestone: false}
+
+evaluation:
+  metrics: [dice, iou, hausdorff]
+  stratify_by:
+    - target_shape
+    - anchor_shape
+    - direction
+    - successful_generation_count
+    - anchor_source
+  counterfactuals:
+    - permute_anchor_channels_fixed_prompt
+    - permute_prompt_clauses_fixed_channels
+    - replace_direction_with_opposite
+    - replace_one_anchor_shape_name
+    - remove_one_anchor
+    - reorder_channels_and_prompt_together
+  qualitative:
+    save_predictions: true
+    num_scenes: 8

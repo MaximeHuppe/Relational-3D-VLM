@@ -1,0 +1,58 @@
+# Dataset split and generalisation protocol.
+#
+# Two independent split axes:
+#   1. scene seeds  -> which scenes belong to train / val / test;
+#   2. target class -> which shape classes may be supervised as targets.
+# All ten classes remain available as ANCHOR names in every split. Only the
+# supervised target class is held out.
+
+split_version: "1.0.0"
+
+scenes:
+  total: 500
+  train: 400
+  val: 50
+  test: 50
+
+# Disjoint, independent layout/seed ranges per split.
+scene_seed_ranges:
+  train: [1000000, 1000400]   # half-open [start, end)
+  val:   [2000000, 2000050]
+  test:  [3000000, 3000050]
+
+# Seven / two / one target-class assignment. Chosen once, deterministically,
+# to maximise geometric diversity of the SUPERVISED set: the seven training
+# classes cover every geometric family in the vocabulary (isotropic box,
+# isotropic ellipsoidal, swept constant-section, swept apex, apex box,
+# toroidal/genus-1, capped-swept), and every held-out class has a close
+# geometric parent inside training, so transfer is compositional rather than
+# a jump to an unseen family.
+#
+#   held-out cuboid           <- anisotropic relative of the trained cube
+#   held-out ellipsoid        <- anisotropic relative of the trained sphere
+#   held-out triangular_prism <- planar-faced prism between cube and pyramid
+target_classes:
+  train: [cube, sphere, cylinder, cone, pyramid, torus, capsule]
+  val:   [cuboid, ellipsoid]
+  test:  [triangular_prism]
+
+anchor_classes:
+  train: all
+  val: all
+  test: all
+
+# Expected example counts if every eligible target is retained. Exact counts
+# must be recomputed and reported after generation and filtering.
+expected_examples:
+  train: 2800   # 400 scenes x 7 target classes
+  val: 100      #  50 scenes x 2 target classes
+  test: 50      #  50 scenes x 1 target class
+
+# Secondary evaluation protocol, enabled once the baseline works.
+secondary_protocols:
+  held_out_size_ranges:
+    enabled: false
+    description: "Target objects drawn from size ranges never seen in training."
+  held_out_packing_patterns:
+    enabled: false
+    description: "Layouts with spatial packing patterns never seen in training."

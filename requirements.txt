@@ -1,0 +1,11 @@
+# Phase 0 (data, schema, tests)
+numpy>=1.26
+pyyaml>=6.0
+pytest>=8.0
+
+# Phase 1 onwards (models, training, evaluation).
+# On Apple Silicon the default wheel ships MPS support; on the RTX 5090 install
+# the CUDA build that matches the local toolkit.
+torch>=2.4
+tqdm>=4.67.1
+wandb>=0.19

@@ -1,0 +1,154 @@
+# Fixed shape vocabulary for Relational3D-VLM.
+#
+# This file is the single source of truth for the ten primitives. Every other
+# module (generator, prompt encoder, Stage A segmenter head, evaluation) must
+# reference these names and integer IDs instead of redefining them.
+#
+# Contract:
+#   * exactly ten classes, IDs 1..10, contiguous and stable forever;
+#   * ID 0 is reserved for background in `instance_labels` and in Stage A;
+#   * every scene contains exactly one instance of each class, so `name` is a
+#     unique identifier inside a scene and is the only anchor identifier used
+#     in prompts;
+#   * shapes are axis-aligned in this milestone - `axis` fields are fixed, not
+#     sampled. Randomising them is orientation randomisation and is deferred.
+#
+# Size ranges are given in voxels for the default 64^3 grid. The design target
+# is an axis extent of roughly 8-22% of the axis length (5.1-14.1 voxels at 64)
+# with broadly comparable occupied volumes (mean ~370-525 voxels per object,
+# ~1.8% total foreground). Documented exception: the torus is necessarily thin
+# along its ring axis (z extent = 2 * minor_radius = 4-5 voxels, 6-8%); its
+# in-plane extents and its occupied volume stay inside the common band.
+#
+# If `generator.volume_shape` is escalated (72^3, 80^3, ...) the ranges are
+# rescaled by the ratio of the new axis length to `reference_axis_length`.
+
+vocabulary_version: "1.0.0"
+reference_axis_length: 64
+background_label: 0
+num_classes: 10
+
+# Bounds used by the config self-check, not by any sampler directly.
+axis_extent_fraction_range: [0.08, 0.22]
+
+shapes:
+  - id: 1
+    name: cube
+    family: box
+    # Isotropic box: extent = side on every axis.
+    params:
+      side: [6.0, 10.0]
+    mean_volume_voxels: 512
+
+  - id: 2
+    name: cuboid
+    family: box
+    # Anisotropic box. Sampled independently per axis; a rejection rule in the
+    # generator forbids near-isotropic draws so a cuboid is never a cube.
+    params:
+      size_x: [5.2, 11.0]
+      size_y: [5.2, 11.0]
+      size_z: [5.2, 11.0]
+    min_anisotropy_ratio: 1.35
+    mean_volume_voxels: 531
+
+  - id: 3
+    name: sphere
+    family: ellipsoidal
+    params:
+      radius: [4.0, 6.0]
+    mean_volume_voxels: 523
+
+  - id: 4
+    name: ellipsoid
+    family: ellipsoidal
+    # Anisotropic ellipsoid; same anti-degeneracy rule as cuboid vs cube.
+    params:
+      radius_x: [3.5, 6.5]
+      radius_y: [3.5, 6.5]
+      radius_z: [3.5, 6.5]
+    min_anisotropy_ratio: 1.35
+    mean_volume_voxels: 523
+
+  - id: 5
+    name: cylinder
+    family: swept
+    axis: z
+    params:
+      radius: [3.0, 5.0]
+      height: [7.0, 13.0]
+    mean_volume_voxels: 502
+
+  - id: 6
+    name: cone
+    family: swept
+    axis: z          # base at low z, apex at high z
+    params:
+      radius: [4.5, 6.5]
+      height: [10.0, 14.0]
+    mean_volume_voxels: 380
+
+  - id: 7
+    name: pyramid
+    family: box
+    axis: z          # square base at low z, apex at high z
+    params:
+      base_side: [8.0, 12.0]
+      height: [10.0, 14.0]
+    mean_volume_voxels: 400
+
+  - id: 8
+    name: triangular_prism
+    family: box
+    axis: y          # isoceles triangle in the x-z plane, extruded along y
+    params:
+      base_width: [8.0, 12.0]     # along x
+      height: [8.0, 12.0]         # along z
+      depth: [7.0, 11.0]          # along y
+    mean_volume_voxels: 450
+
+  - id: 9
+    name: torus
+    family: toroidal
+    axis: z          # ring lies in the x-y plane, hole along z
+    params:
+      major_radius: [3.0, 4.5]
+      minor_radius: [2.0, 2.5]
+    thin_axis_exception: z
+    mean_volume_voxels: 374
+
+  - id: 10
+    name: capsule
+    family: swept
+    axis: z          # cylinder segment plus two hemispherical caps
+    params:
+      radius: [3.5, 4.5]
+      segment_length: [3.0, 5.0]  # straight part only; total z extent = 2r + L
+    mean_volume_voxels: 469
+
+# Direction vocabulary. Exactly these six tokens may appear in a prompt.
+# No synonyms, no ordinal references, no target-shape names.
+directions:
+  - anterior
+  - posterior
+  - superior
+  - inferior
+  - medial
+  - lateral
+
+direction_opposites:
+  anterior: posterior
+  posterior: anterior
+  superior: inferior
+  inferior: superior
+  medial: lateral
+  lateral: medial
+
+# Which world axis each direction pair is decided on.
+direction_axis:
+  anterior: y
+  posterior: y
+  superior: z
+  inferior: z
+  medial: x
+  lateral: x
