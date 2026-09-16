@@ -1,22 +1,45 @@
-"""Counterfactual probes. Not implemented yet - planned with the Phase 4 report.
+"""Correspondence probes with occupancy held fixed.
 
-Mandatory set: permute anchor channels with the prompt fixed; permute prompt
-clauses with the channels fixed; replace one direction with its opposite;
-replace one anchor shape name; remove one anchor; reorder channels and prompt
-clauses together (which must be a no-op).
+A high Dice on occupancy is not enough: the decoder can copy a remaining blob
+without reading the prompt. These probes keep ``scene_volume`` unchanged and
+only rewrite the WHERE inputs. If the binary mask barely moves, the model is
+prompt-invariant.
 
-The Stage B architecture is already *sensitive* to the first five - each changes
-the prediction, which ``tests/test_stage_b_contract.py`` asserts - and the model
-takes the permutations directly, since a counterfactual is just a reordered
-``anchor_masks`` / ``direction_ids`` / ``anchor_shape_ids`` triple. What is
-missing is the scored battery over a trained checkpoint.
-
-A high Dice is insufficient: the model must be measurably sensitive to
-direction-anchor correspondence and must beat the union-mask baseline here.
+The full Phase 4 battery (union-mask baseline, joint reorder as a no-op) is
+still reserved for ``scripts/evaluate.py``. This module is the occupancy
+sanity subset: permute channels with the prompt fixed, and replace one
+direction with its opposite.
 """
 
 from __future__ import annotations
 
+from typing import Sequence
 
-def permute_anchor_channels(*args, **kwargs):  # pragma: no cover - Phase 4 report
-    raise NotImplementedError("the scored counterfactual battery lands with the Phase 4 report")
+from torch import Tensor
+
+from src.data.direction_rules import DIRECTIONS, opposite_direction
+
+CHANNEL_PERMUTATION: tuple[int, ...] = (2, 0, 1)
+
+
+def permute_anchor_channels(
+    anchor_masks: Tensor, order: Sequence[int] = CHANNEL_PERMUTATION
+) -> Tensor:
+    """Reorder the three mask channels; the prompt and occupancy stay put."""
+    permutation = tuple(int(index) for index in order)
+    if sorted(permutation) != list(range(anchor_masks.shape[1])):
+        raise ValueError(
+            f"order must be a permutation of 0..{anchor_masks.shape[1] - 1}, got {permutation}"
+        )
+    return anchor_masks[:, list(permutation)]
+
+
+def flip_one_direction(direction_ids: Tensor, slot: int = 0) -> Tensor:
+    """Replace clause ``slot`` with its opposite token; occupancy stays put."""
+    if slot < 0 or slot >= direction_ids.shape[-1]:
+        raise ValueError(f"slot {slot} is out of range for {tuple(direction_ids.shape)}")
+    flipped = direction_ids.clone()
+    for batch_index in range(flipped.shape[0]):
+        name = DIRECTIONS[int(flipped[batch_index, slot])]
+        flipped[batch_index, slot] = DIRECTIONS.index(opposite_direction(name))
+    return flipped

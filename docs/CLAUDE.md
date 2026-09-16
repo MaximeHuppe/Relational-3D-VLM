@@ -293,6 +293,8 @@ Mandatory counterfactual tests:
 
 The full model should be sensitive to correspondence and should outperform the union-mask baseline on relational counterfactuals. A high Dice score is insufficient if shuffled prompts and masks produce nearly identical predictions.
 
+Occupancy sanity (run after Stage B training and `--eval-only`): permute the three anchor channels and flip one direction with occupancy held fixed — the mask must move or collapse; compare train vs val Dice (both high means localisation is generalising; train high / val low means WHERE is still the problem); a qualitative slice plus a component count must show one remaining object, not the union of the seven.
+
 ## Reproducibility and engineering requirements
 
 - Save configuration, random seeds, generator version, direction-rule version, vocabulary version, git revision, hardware, and checkpoint metadata for every run.
@@ -338,6 +340,7 @@ src/
     metrics.py
     counterfactuals.py
     qualitative.py
+    occupancy_sanity.py
 scripts/
   generate_dataset.py
   train_shape_segmenter.py

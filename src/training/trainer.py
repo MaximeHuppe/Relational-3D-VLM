@@ -949,6 +949,46 @@ class StageBTrainer:
         summary["table"] = format_stratified_table(summary)
         return summary
 
+    @torch.no_grad()
+    def occupancy_sanity(
+        self,
+        loader: DataLoader | None = None,
+        *,
+        train_dice: float | None = None,
+        val_dice: float | None = None,
+        max_batches: int | None = None,
+        num_slices: int = 8,
+    ) -> dict[str, Any]:
+        """Prompt / train-val / one-object-not-union checks with occupancy fixed.
+
+        Anchors come from the same provider as :meth:`evaluate`, so a predicted-
+        anchor run probes the channels Stage A actually supplied.
+        """
+        from src.evaluation.occupancy_sanity import run_occupancy_sanity
+
+        loader = loader or self.val_loader or self.train_loader
+        self.model.eval()
+        reset = getattr(self.anchor_provider, "reset", None)
+        if callable(reset):
+            reset()
+
+        def prepare_batch(batch: Mapping[str, Any]) -> dict[str, Any]:
+            moved = self._to_device(batch)
+            moved["anchor_masks"] = self.anchor_provider(moved).to(self.device)
+            return moved
+
+        return run_occupancy_sanity(
+            self.model,
+            loader,
+            output_dir=self.output_dir,
+            train_dice=train_dice,
+            val_dice=val_dice,
+            threshold=self.settings.threshold,
+            max_batches=max_batches,
+            num_slices=num_slices,
+            prepare_batch=prepare_batch,
+        )
+
     def fit(self) -> list[StageBEpochResult]:
         """Run the schedule, checkpointing the best validation Dice."""
         seed_everything(self.settings.seed)

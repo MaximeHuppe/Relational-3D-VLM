@@ -40,6 +40,11 @@ The scene volume is loaded for every Stage B run: Stage A (predicted anchors)
 and the Stage B decoder (occupancy) are its two consumers. Instance labels
 never reach Stage B.
 
+After oracle training, overfit, and ``--eval-only``, the run also prints an
+occupancy sanity report (prompt permutation / direction flip with occupancy
+held fixed, train vs val localisation, one remaining object vs the union)
+unless ``--skip-occupancy-sanity`` is set.
+
 Examples::
 
     .venv/bin/python scripts/train_relational_model.py --phase overfit --smoke
@@ -68,6 +73,7 @@ from src.data.dataset import (  # noqa: E402
     build_example_dataloader,
     example_records,
 )
+from src.evaluation.occupancy_sanity import last_train_dice  # noqa: E402
 from src.models.anchor_provider import ANCHOR_SOURCES, build_anchor_provider  # noqa: E402
 from src.models.relational_vlm import (  # noqa: E402
     VARIANTS,
@@ -153,6 +159,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--eval-only", action="store_true", help="skip training; evaluate --checkpoint",
+    )
+    parser.add_argument(
+        "--skip-occupancy-sanity",
+        action="store_true",
+        help="skip prompt-invariance, train/val localisation, and one-object-vs-union checks",
     )
     parser.add_argument(
         "--checkpoint", type=Path, default=None,
@@ -355,6 +366,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                     f"empty {quality['empty_anchor_fraction']:.1%}"
                 )
         write_report(output_dir / f"evaluation_{args.eval_split}_{anchor_source}.json", report)
+        if not args.skip_occupancy_sanity:
+            sanity = trainer.occupancy_sanity(
+                loader,
+                train_dice=last_train_dice(output_dir),
+                val_dice=float(report["overall"]["dice"]),
+            )
+            print_occupancy_sanity(sanity, output_dir, verbose)
         return 0
 
     if args.phase == "overfit":
@@ -377,6 +395,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(report["metrics"].get("table", ""))
             print(f"report      : {output_dir}/overfit_report.json")
             print(f"metrics     : {output_dir}/metrics.jsonl")
+        if not args.skip_occupancy_sanity:
+            sanity = runner.occupancy_sanity(
+                train_loader,
+                train_dice=float(report["final_train_dice"]),
+                val_dice=None,
+            )
+            print_occupancy_sanity(sanity, output_dir, verbose)
         return 0 if report["passed"] else 1
 
     trainer = StageBTrainer(
@@ -401,6 +426,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"history     : {output_dir}/history.json")
         print(f"metrics     : {output_dir}/metrics.jsonl")
     write_report(output_dir / f"final_{args.eval_split}_{anchor_source}.json", final)
+    if not args.skip_occupancy_sanity:
+        train_dice = history[-1].train_dice if history else last_train_dice(output_dir)
+        sanity = trainer.occupancy_sanity(
+            val_loader,
+            train_dice=train_dice,
+            val_dice=float(final["overall"]["dice"]),
+        )
+        print_occupancy_sanity(sanity, output_dir, verbose)
     return 0 if history else 1
 
 
@@ -410,6 +443,14 @@ def write_report(path: Path, report: dict) -> None:
         json.dumps({k: v for k, v in report.items() if k != "table"}, indent=2) + "\n",
         encoding="utf-8",
     )
+
+
+def print_occupancy_sanity(report: dict, output_dir: Path, verbose: bool) -> None:
+    if not verbose:
+        return
+    print()
+    print(report["table"])
+    print(f"occupancy sanity : {output_dir}/occupancy_sanity.json")
 
 
 if __name__ == "__main__":
