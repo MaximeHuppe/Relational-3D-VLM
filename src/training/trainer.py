@@ -276,6 +276,21 @@ def build_scheduler(
     return torch.optim.lr_scheduler.LambdaLR(optimizer, factor)
 
 
+def _set_loader_epoch(loader: DataLoader, epoch: int) -> None:
+    """Move an augmenting dataset to ``epoch`` before its iterator is built.
+
+    Persistent dataloader workers hold their own copy of the dataset and only
+    re-read it between epochs, so this has to happen before ``iter(loader)`` -
+    afterwards the first prefetched batches would still carry the old pose.
+    ``RotationAugmentation`` keeps the counter in shared memory for exactly that
+    reason. A dataset without ``set_epoch``, or one without an augmentation, is
+    untouched.
+    """
+    set_epoch = getattr(getattr(loader, "dataset", None), "set_epoch", None)
+    if callable(set_epoch):
+        set_epoch(epoch)
+
+
 def _epoch_progress(
     loader: DataLoader,
     *,
@@ -414,6 +429,7 @@ class StageATrainer:
         totals: dict[str, float] = {}
         total_loss, total_dice, steps = 0.0, 0.0, 0
         self.optimizer.zero_grad(set_to_none=True)
+        _set_loader_epoch(self.train_loader, epoch)
 
         progress = _epoch_progress(
             self.train_loader,
@@ -719,6 +735,7 @@ class StageBTrainer:
         totals: dict[str, float] = {}
         total_loss, total_dice, steps = 0.0, 0.0, 0
         self.optimizer.zero_grad(set_to_none=True)
+        _set_loader_epoch(self.train_loader, epoch)
 
         progress = _epoch_progress(
             self.train_loader,
@@ -977,6 +994,8 @@ class StageBOverfitRunner(StageBTrainer):
         ) as logger:
             pass_index = 0
             while self.steps_run < budget and not self.reached_target:
+                # One pass over the single scene is one epoch's worth of poses.
+                _set_loader_epoch(self.train_loader, pass_index)
                 losses: list[float] = []
                 dices: list[float] = []
                 totals: dict[str, float] = {}

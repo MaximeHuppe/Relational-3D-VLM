@@ -34,6 +34,7 @@ from src.config import load_all_configs, load_config  # noqa: E402
 from src.data.dataset import SceneDataset, build_dataloader  # noqa: E402
 from src.data.primitives import SHAPE_NAMES  # noqa: E402
 from src.models.shape_segmenter import build_shape_segmenter  # noqa: E402
+from src.training.augmentations import build_rotation_augmentation  # noqa: E402
 from src.training.logger import logging_config  # noqa: E402
 from src.training.trainer import StageATrainer, TrainingSettings, resolve_device  # noqa: E402
 
@@ -78,6 +79,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--output", type=Path, default=None,
         help="checkpoint directory (default: runs/stage_a[_smoke])",
     )
+    parser.add_argument(
+        "--augment", dest="augment", action="store_true", default=None,
+        help="rotate the training scenes per epoch (default: whatever "
+             "augmentations.rotation_90.apply_to.stage_a says in configs/train.yaml)",
+    )
+    parser.add_argument(
+        "--no-augment", dest="augment", action="store_false",
+        help="train on the stored pose only",
+    )
     parser.add_argument("--quiet", action="store_true")
     return parser.parse_args(argv)
 
@@ -117,7 +127,30 @@ def main(argv: Sequence[str] | None = None) -> int:
         },
     )
 
-    train_dataset = SceneDataset(data_root, "train", limit=args.limit_scenes)
+    # Built against the training split's own grid, and attached to that split
+    # alone: the validation scenes stay in the stored pose, or the metric stops
+    # being comparable with an unaugmented run.
+    probe = SceneDataset(data_root, "train", limit=args.limit_scenes)
+    augmentations = dict(load_config("train")["augmentations"])
+    if args.augment is not None:
+        # An explicit flag overrides the per-stage switch. It does not override
+        # the `rewrite_tested` gate, which stays the one hard requirement.
+        rotation = dict(augmentations.get("rotation_90", {}))
+        rotation["apply_to"] = {**rotation.get("apply_to", {}), "stage_a": args.augment}
+        augmentations = {**augmentations, "rotation_90": rotation}
+        if args.augment:
+            augmentations["enabled"] = True
+    train_augmentation = build_rotation_augmentation(
+        augmentations,
+        volume_shape=probe.volume_shape,
+        spacing=probe.spacing,
+        seed=settings.seed,
+        stage="stage_a",
+    )
+
+    train_dataset = SceneDataset(
+        data_root, "train", limit=args.limit_scenes, augment=train_augmentation
+    )
     val_dataset = SceneDataset(data_root, "val", limit=args.limit_scenes)
     train_loader = build_dataloader(
         train_dataset,

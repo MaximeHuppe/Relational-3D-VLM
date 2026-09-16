@@ -48,17 +48,25 @@ def git_is_dirty(root: Path | str = PROJECT_ROOT) -> bool | None:
 
 
 def version_metadata() -> dict[str, str]:
-    """The four contract versions that must agree between code, data and runs."""
+    """The contract versions that must agree between code, data and runs.
+
+    ``augmentation_version`` covers the rotation sampling and the direction
+    rewrite. The checkpoint already stores the augmentation *settings* with the
+    rest of the configs; this pins the *logic* that read them, so a run trained
+    under an older rewrite is still identifiable after the rule changes.
+    """
     from src.config import load_config
     from src.data.direction_rules import DIRECTION_RULE_VERSION
     from src.data.primitives import VOCABULARY_VERSION
     from src.data.schema import SCHEMA_VERSION
+    from src.training.augmentations import AUGMENTATION_VERSION
 
     return {
         "generator_version": str(load_config("generator")["generator_version"]),
         "direction_rule_version": DIRECTION_RULE_VERSION,
         "vocabulary_version": VOCABULARY_VERSION,
         "schema_version": SCHEMA_VERSION,
+        "augmentation_version": AUGMENTATION_VERSION,
     }
 
 

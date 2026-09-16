@@ -62,13 +62,18 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.config import load_all_configs, load_config  # noqa: E402
-from src.data.dataset import ExampleDataset, build_example_dataloader  # noqa: E402
+from src.data.dataset import (  # noqa: E402
+    ExampleDataset,
+    build_example_dataloader,
+    example_records,
+)
 from src.models.anchor_provider import ANCHOR_SOURCES, build_anchor_provider  # noqa: E402
 from src.models.relational_vlm import (  # noqa: E402
     VARIANTS,
     build_relational_vlm,
     load_relational_vlm,
 )
+from src.training.augmentations import build_rotation_augmentation  # noqa: E402
 from src.training.logger import logging_config  # noqa: E402
 from src.training.trainer import (  # noqa: E402
     StageBOverfitRunner,
@@ -135,6 +140,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--eval-split", default="val", choices=("train", "val", "test"),
         help="split used for evaluation",
+    )
+    parser.add_argument(
+        "--augment", dest="augment", action="store_true", default=None,
+        help="rotate the training examples per epoch and rewrite their directions "
+             "(default: on for --phase oracle, off for --phase overfit)",
+    )
+    parser.add_argument(
+        "--no-augment", dest="augment", action="store_false",
+        help="train on the stored pose only",
     )
     parser.add_argument(
         "--eval-only", action="store_true", help="skip training; evaluate --checkpoint",
@@ -207,20 +221,43 @@ def main(argv: Sequence[str] | None = None) -> int:
     run_name = output_dir.name
     full_config = load_all_configs()
 
+    # The augmentation is built against the split's grid, so read it from the
+    # manifest before any dataset is constructed.
+    probe_record = example_records(data_root, "train")[0].metadata
+    volume_shape, spacing = probe_record.volume_shape, probe_record.spacing
+
     # -- data --------------------------------------------------------------
+    # Phase 2 is a wiring bug-catcher measured by how far one scene can be
+    # overfit, so it runs on the stored pose unless --augment is asked for
+    # explicitly; augmenting it would move the goalposts rather than find bugs.
+    # Never on the evaluation split: the metric has to stay comparable.
+    augment_wanted = args.phase == "oracle" if args.augment is None else args.augment
+    train_augmentation = (
+        build_rotation_augmentation(
+            load_config("train")["augmentations"],
+            volume_shape=volume_shape,
+            spacing=spacing,
+            seed=settings.seed,
+            stage="stage_b",
+        )
+        if augment_wanted
+        else None
+    )
+
     if args.phase == "overfit":
         scene_ids = [args.scene_id] if args.scene_id else None
         if scene_ids is None:
             probe = ExampleDataset(data_root, "train")
             scene_ids = probe.scene_ids[: load_config("train")["stage_b_overfit"]["scenes"]]
         train_dataset = ExampleDataset(
-            data_root, "train", scene_ids=scene_ids, include_scene_volume=needs_scene_volume
+            data_root, "train", scene_ids=scene_ids,
+            include_scene_volume=needs_scene_volume, augment=train_augmentation,
         )
         val_dataset = None
     else:
         train_dataset = ExampleDataset(
             data_root, "train", limit=args.limit_examples,
-            include_scene_volume=needs_scene_volume,
+            include_scene_volume=needs_scene_volume, augment=train_augmentation,
         )
         val_dataset = ExampleDataset(
             data_root, args.eval_split, limit=args.limit_examples,

@@ -12,13 +12,23 @@ ordered anchor channels, a three-clause prompt and the target mask that
 supervises it - read from the same manifests. :class:`ExampleDataset` is filtered
 by ``configs/split.yaml`` at generation time, so it yields only the target
 classes a split is allowed to supervise.
+
+Augmentation
+------------
+Both datasets accept an optional ``augment``
+(:class:`src.training.augmentations.RotationAugmentation`). When one is given,
+every item is drawn in a rotated pose that changes per epoch, and Stage B's
+clause triple is re-derived for that pose - see that module for why the
+directions cannot be relabelled token-by-token. Augmentation is opt-in per
+dataset, so it is attached to the training split and never to validation or
+test, and the corpus on disk is never modified.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 import numpy as np
 import torch
@@ -27,6 +37,9 @@ from torch.utils.data import DataLoader, Dataset
 from src.data.primitives import SHAPE_NAMES, SHAPE_VOCABULARY
 from src.data.prompt_generator import clause_indices
 from src.data.schema import ExampleArrays, ExampleMetadata, load_scene_arrays, read_manifest
+
+if TYPE_CHECKING:  # pragma: no cover - `src.data` must not import `src.training`
+    from src.training.augmentations import RotationAugmentation
 
 
 class DatasetError(RuntimeError):
@@ -41,6 +54,7 @@ class SceneRecord:
     path: Path
     seed: int
     volume_shape: tuple[int, int, int]
+    spacing: tuple[float, float, float]
 
 
 def scene_records(root: Path | str, split: str) -> list[SceneRecord]:
@@ -65,6 +79,7 @@ def scene_records(root: Path | str, split: str) -> list[SceneRecord]:
             path=path,
             seed=metadata.seed,
             volume_shape=metadata.volume_shape,
+            spacing=metadata.spacing,
         )
     if not records:
         raise DatasetError(f"no scenes listed in {manifest}")
@@ -94,6 +109,15 @@ class SceneDataset(Dataset):
             Caching the derived tensors instead would cost ~13.6 MB per scene -
             5.4 GB for a 400-scene split, multiplied again by every persistent
             dataloader worker.
+        augment: rotate each scene into a per-epoch pose. Stage A has no
+            relations to rewrite - the scene and all ten masks rotate together,
+            and a rotated cube is still a cube - so the labels stay correct by
+            construction. It is still off by default: the generator only ever
+            emits shapes in their canonical orientation (cones point ``+z``, and
+            so on), so rotating them is a real change to the training
+            distribution that evaluation does not share. The cache is filled
+            with the stored pose and rotated afterwards, so one cached scene
+            still backs every epoch.
     """
 
     def __init__(
@@ -104,6 +128,7 @@ class SceneDataset(Dataset):
         prompt_names: Sequence[str] | None = None,
         limit: int | None = None,
         cache: bool = True,
+        augment: "RotationAugmentation | None" = None,
     ) -> None:
         self.root = Path(root)
         self.split = split
@@ -120,6 +145,10 @@ class SceneDataset(Dataset):
                 "shape. Regenerate without grid escalation or train per shape."
             )
         self.volume_shape = next(iter(shapes))
+        spacings = {record.spacing for record in self.records}
+        if len(spacings) != 1:
+            raise DatasetError(f"split {split!r} mixes spacings {sorted(spacings)}")
+        self.spacing = next(iter(spacings))
 
         names = tuple(prompt_names) if prompt_names is not None else SHAPE_NAMES
         self.prompt_names = SHAPE_VOCABULARY.require_names(names)
@@ -128,9 +157,15 @@ class SceneDataset(Dataset):
         )
         self.instance_ids = [SHAPE_VOCABULARY.name_to_id(name) for name in self.prompt_names]
         self._cache: dict[int, tuple[torch.Tensor, torch.Tensor]] | None = {} if cache else None
+        self.augment = augment
 
     def __len__(self) -> int:
         return len(self.records)
+
+    def set_epoch(self, epoch: int) -> None:
+        """Advance the augmentation pose. A no-op when not augmenting."""
+        if self.augment is not None:
+            self.augment.set_epoch(epoch)
 
     def _volumes(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
         """The two compact uint8 volumes of a scene, cached as stored on disk."""
@@ -147,6 +182,13 @@ class SceneDataset(Dataset):
 
     def __getitem__(self, index: int) -> dict:
         scene_volume, labels = self._volumes(index)
+        rotation = None
+        if self.augment is not None:
+            rotation = self.augment.sample(index)
+            # One rotation for both volumes, so every mask stays the mask of the
+            # instance it labels.
+            scene_volume = rotation.apply_tensor(scene_volume)
+            labels = rotation.apply_tensor(labels)
         masks = torch.stack(
             [(labels == instance_id) for instance_id in self.instance_ids]
         ).to(torch.float32)
@@ -156,6 +198,7 @@ class SceneDataset(Dataset):
             "target_masks": masks,
             "prompt_ids": self.prompt_ids.clone(),
             "scene_id": self.records[index].scene_id,
+            "rotation": rotation.code if rotation is not None else "",
         }
 
     def cache_bytes(self) -> int:
@@ -168,9 +211,10 @@ class SceneDataset(Dataset):
         return per_scene * len(self._cache)
 
     def describe(self) -> str:
+        augment = "" if self.augment is None else f", {self.augment.describe()}"
         return (
             f"{self.split}: {len(self)} scenes at {self.volume_shape}, "
-            f"{len(self.prompt_names)} prompts"
+            f"{len(self.prompt_names)} prompts{augment}"
         )
 
 
@@ -272,7 +316,8 @@ class ExampleDataset(Dataset):
     ``scene_volume``       ``[1, D, H, W]`` float32, **only** when
                            ``include_scene_volume=True``;
     plus ``example_id``, ``scene_id``, ``prompt``, ``target_shape_name``,
-    ``anchor_shape_names`` and ``directions`` for reporting and stratification.
+    ``anchor_shape_names``, ``directions`` and ``rotation`` for reporting and
+    stratification.
 
     The target mask is the label, never an input: :func:`stage_b_model_inputs`
     is the only sanctioned way to build the model's arguments from an item, and
@@ -294,6 +339,14 @@ class ExampleDataset(Dataset):
             scene. Cheap (once per scene) and fails fast on a corrupt corpus.
         cache: hold decoded ``instance_labels`` in memory, one copy per scene
             shared by that scene's examples.
+        augment: rotate each example into a per-epoch pose and re-derive its
+            three directions for that pose. The anchors, their order and the
+            target are untouched; ``direction_ids``, ``prompt`` and
+            ``directions`` all come from the rewrite, so the tensors and the
+            text can never disagree. Attach it to the training split only -
+            validation and test must stay in the stored pose, or the metric
+            stops being comparable. Validation still runs against the stored
+            arrays, before any rotation.
     """
 
     def __init__(
@@ -307,6 +360,7 @@ class ExampleDataset(Dataset):
         include_scene_volume: bool = False,
         validate: bool = True,
         cache: bool = True,
+        augment: "RotationAugmentation | None" = None,
     ) -> None:
         self.root = Path(root)
         self.split = split
@@ -333,9 +387,15 @@ class ExampleDataset(Dataset):
         self.validate = bool(validate)
         self._scene_cache: dict[str, tuple[np.ndarray, np.ndarray]] | None = {} if cache else None
         self._validated: set[str] = set()
+        self.augment = augment
 
     def __len__(self) -> int:
         return len(self.records)
+
+    def set_epoch(self, epoch: int) -> None:
+        """Advance the augmentation pose. A no-op when not augmenting."""
+        if self.augment is not None:
+            self.augment.set_epoch(epoch)
 
     def target_shape_counts(self) -> dict[str, int]:
         """How many examples each target class contributes."""
@@ -374,12 +434,29 @@ class ExampleDataset(Dataset):
             self._validated.add(metadata.example_id)
 
         labels = np.asarray(instance_labels)
+        relations = metadata.relations
+        prompt = metadata.prompt
+        rotation_code = ""
+        if self.augment is not None:
+            # The pose and the clause triple are chosen together: the rewrite is
+            # what decides whether a drawn rotation is usable at all, so the
+            # arrays are rotated only once a legal triple exists for them.
+            plan = self.augment.plan(metadata, index)
+            labels = plan.rotation.apply(labels)
+            if self.include_scene_volume:
+                # Same rotation, so predicted anchors line up with the channels
+                # they replace.
+                scene_volume = plan.rotation.apply(np.asarray(scene_volume))
+            relations = list(plan.relations)
+            prompt = plan.prompt
+            rotation_code = plan.rotation.code
+
         anchor_masks = np.stack(
             [(labels == instance_id) for instance_id in metadata.anchor_instance_ids]
         ).astype(np.float32)
         target_mask = (labels == metadata.target_instance_id).astype(np.float32)
 
-        directions, shape_ids = clause_indices(metadata.relations)
+        directions, shape_ids = clause_indices(relations)
         item = {
             "anchor_masks": torch.from_numpy(anchor_masks),
             "target_mask": torch.from_numpy(target_mask).unsqueeze(0),
@@ -390,10 +467,13 @@ class ExampleDataset(Dataset):
             "anchor_shape_ids": torch.tensor(shape_ids, dtype=torch.long),
             "example_id": metadata.example_id,
             "scene_id": metadata.scene_id,
-            "prompt": metadata.prompt,
+            "prompt": prompt,
             "target_shape_name": metadata.target_shape_name,
-            "anchor_shape_names": list(metadata.anchor_shape_names),
-            "directions": list(metadata.structured_prompt.directions),
+            "anchor_shape_names": [clause["anchor"] for clause in relations],
+            "directions": [clause["direction"] for clause in relations],
+            # Empty when unaugmented; otherwise the pose this item was drawn in,
+            # so a stratified report can separate them.
+            "rotation": rotation_code,
         }
         if self.include_scene_volume:
             item["scene_volume"] = torch.from_numpy(
@@ -403,9 +483,10 @@ class ExampleDataset(Dataset):
 
     def describe(self) -> str:
         counts = ", ".join(f"{name} {count}" for name, count in self.target_shape_counts().items())
+        augment = "" if self.augment is None else f", {self.augment.describe()}"
         return (
             f"{self.split}: {len(self)} examples from {len(self.scene_ids)} scenes "
-            f"at {self.volume_shape} [{counts}]"
+            f"at {self.volume_shape} [{counts}]{augment}"
         )
 
 
@@ -420,6 +501,7 @@ STAGE_B_NON_INPUT_KEYS: tuple[str, ...] = (
     "target_shape_name",
     "anchor_shape_names",
     "directions",
+    "rotation",
 )
 
 

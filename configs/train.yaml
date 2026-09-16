@@ -1,7 +1,7 @@
 # Training procedure (Phases 1-4 implementation; hyperparameters fixed here).
 # Phase 0 runs no training.
 
-train_version: "1.1.0"   # 1.1.0: Stage B (Phases 2-4) schedules and anchor sources
+train_version: "1.2.0"   # 1.2.0: rotation_90 augmentation with the direction rewrite
 
 common:
   seed: 20260915
@@ -78,7 +78,7 @@ hardware_profiles:
     # Not measured on this hardware. On CUDA, unlike MPS, bf16 autocast does cut
     # activation memory and does use the tensor cores, so raising batch_size
     # should pay off there - tune it on the real device.
-    batch_size: 8
+    batch_size: 16
     gradient_accumulation_steps: 1
     precision: bf16
     num_workers: 8
@@ -167,7 +167,42 @@ augmentations:
   # Relation-preserving only. An augmentation stays disabled until its relation
   # rewrite (masks, world coordinates, centroids/extents, direction labels,
   # prompt clauses) has a passing unit test.
-  enabled: false
+  enabled: true
+
+  # Axis-aligned 90-degree rotations: one angle drawn per world axis, composed.
+  # Proper rotations only, so the 64 angle triples land on the 24 elements of
+  # the octahedral group, and the volume stays axis-aligned - this is not the
+  # `arbitrary_rotation` that the milestone forbids.
+  #
+  # The three directions are re-derived from the rotated centroids with
+  # src/data/direction_rules.py, never relabelled token-by-token: a 180-degree
+  # turn does swap each axis pair, but a 90-degree turn moves a pair between the
+  # signed superior/inferior-anterior/posterior rules and the centre-distance
+  # medial/lateral rule, and neither token carries what the other one needs.
+  # Rotations whose rewrite is illegal (two clauses collapsing onto the same
+  # direction, or an exact medial/lateral tie) are redrawn up to `max_attempts`
+  # times; ~8% of (example, rotation) pairs are rejected on the smoke corpus.
+  # Rewrite tested in tests/test_augmentations.py against directions recomputed
+  # from the rotated masks.
+  rotation_90:
+    enabled: true
+    rewrite_tested: true
+    angles: [0, 90, 180, -90]
+    axes: [x, y, z]
+    max_attempts: 8
+    apply_to:
+      # Stage B is the point: the prompt has to follow the volume.
+      stage_b: true
+      # Off by default for Stage A. It is label-consistent (scene and all ten
+      # masks rotate together), but the generator only emits shapes in their
+      # canonical orientation, so rotating them shifts Stage A's training
+      # distribution away from the un-augmented evaluation set. Turn it on
+      # deliberately, as an experiment, not by default.
+      stage_a: false
+
+  # Mirror reflections, translation, cropping and bare axis permutation are
+  # still unimplemented; a 180-degree rotation is two of the flips composed, so
+  # rotation_90 already covers the axis-reversing part of flip_*.
   flip_x: {enabled: false, rewrite_tested: false}
   flip_y: {enabled: false, rewrite_tested: false}
   flip_z: {enabled: false, rewrite_tested: false}
