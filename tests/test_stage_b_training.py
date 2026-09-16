@@ -349,12 +349,43 @@ def test_stage_b_settings_resolve_from_the_config():
     overfit = TrainingSettings.for_stage_b(phase="overfit")
     oracle = TrainingSettings.for_stage_b(phase="oracle")
     assert overfit.steps > 0 and overfit.target_train_dice == 0.95
-    assert oracle.epochs == 100 and oracle.anchor_source == "oracle"
+    assert oracle.epochs == 30 and oracle.anchor_source == "oracle"
     smoke = TrainingSettings.for_stage_b(phase="oracle", smoke=True)
     assert smoke.model_profile == "smoke" and smoke.epochs < oracle.epochs
     assert TrainingSettings.for_stage_b(phase="oracle", overrides={"epochs": 2}).epochs == 2
     with pytest.raises(ValueError):
         TrainingSettings.for_stage_b(phase="predicted")
+
+
+def test_stage_b_settings_load_early_stopping_from_the_config():
+    oracle = TrainingSettings.for_stage_b(phase="oracle")
+    assert oracle.early_stopping_patience > 0
+    assert oracle.early_stopping_min_delta > 0.0
+    assert TrainingSettings.for_stage_b(phase="oracle", smoke=True).early_stopping_patience == 0
+
+
+def test_stage_b_fit_stops_when_val_dice_plateaus(tmp_path):
+    loader = torch.utils.data.DataLoader([{"unused": 0}])
+    settings = TrainingSettings(
+        epochs=20,
+        device="cpu",
+        warmup_epochs=0,
+        seed=0,
+        early_stopping_patience=2,
+        early_stopping_min_delta=0.05,
+    )
+    trainer = StageBTrainer(
+        RelationalVLM(SMALL), settings, loader, loader, output_dir=tmp_path, verbose=False
+    )
+    trainer.train_epoch = lambda epoch: (1.0, {"dice": 0.5}, 0.5)
+    scores = [0.10, 0.20, 0.21, 0.21, 0.90]
+    trainer.evaluate = lambda loader=None, **kwargs: {"overall": {"dice": scores.pop(0)}}
+    history = trainer.fit()
+    assert len(history) == 4
+    assert trainer.stopped_early
+    assert trainer.best_epoch == 2
+    assert trainer.best_dice == pytest.approx(0.21)
+    assert json.loads((tmp_path / "last.json").read_text())["extra"]["stopped_early"] is True
 
 
 def test_autocast_is_disabled_on_cpu_where_it_is_a_30x_regression():

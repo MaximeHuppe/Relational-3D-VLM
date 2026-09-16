@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -51,6 +51,78 @@ from src.training.logger import (
     metrics_from_stage_b,
 )
 from src.training.losses import deep_supervision_loss, segmentation_loss
+
+
+def _early_stopping_from_config(
+    common: Mapping[str, Any], stage: Mapping[str, Any]
+) -> tuple[int, float]:
+    """Merge ``common.early_stopping`` with an optional per-stage override."""
+    block: dict[str, Any] = {}
+    for source in (common, stage):
+        raw = source.get("early_stopping") or {}
+        if isinstance(raw, Mapping):
+            block.update(raw)
+    patience = int(block.get("patience", 0))
+    min_delta = float(block.get("min_delta", 0.0))
+    if not bool(block.get("enabled", True)):
+        return 0, min_delta
+    return patience, min_delta
+
+
+@dataclass
+class EarlyStopping:
+    """Halt when a maximised metric has not improved by ``min_delta`` for ``patience`` epochs.
+
+    ``patience <= 0`` disables the rule. The first observed value always counts
+    as an improvement so a run cannot stop before it has a baseline. An
+    improvement is ``metric > best + min_delta``; smaller rises still update
+    the checkpointed best Dice in the trainer, but they do not reset the wait.
+    """
+
+    patience: int = 0
+    min_delta: float = 0.0
+    best: float = field(default=-float("inf"), init=False)
+    wait: int = field(default=0, init=False)
+    stopped: bool = field(default=False, init=False)
+
+    def update(self, metric: float) -> bool:
+        """Record ``metric``. Returns True when training should stop."""
+        score = float(metric)
+        if self.patience <= 0:
+            if score > self.best:
+                self.best = score
+            return False
+        if score > self.best + self.min_delta:
+            self.best = score
+            self.wait = 0
+            return False
+        self.wait += 1
+        self.stopped = self.wait >= self.patience
+        return self.stopped
+
+
+def _should_stop_early(
+    stopper: EarlyStopping,
+    *,
+    val_metrics: Mapping[str, Any],
+    val_dice: float,
+    epoch: int,
+    best_dice: float,
+    best_epoch: int,
+    verbose: bool,
+) -> bool:
+    """True when validation Dice has stalled for ``stopper.patience`` epochs."""
+    if not val_metrics or stopper.patience <= 0:
+        return False
+    if not stopper.update(val_dice):
+        return False
+    if verbose:
+        print(
+            f"early stopping at epoch {epoch}: val dice {val_dice:.4f} has not "
+            f"improved by more than {stopper.min_delta} for {stopper.patience} "
+            f"epochs (best {best_dice:.4f} at epoch {best_epoch})"
+        )
+    return True
 
 
 def resolve_device(name: str = "auto") -> torch.device:
@@ -98,6 +170,10 @@ class TrainingSettings:
     steps: int = 0
     target_train_dice: float = 0.95
     anchor_source: str = "oracle"
+    # Halt when val Dice has not risen by more than min_delta for this many
+    # consecutive epochs. patience=0 disables the rule.
+    early_stopping_patience: int = 0
+    early_stopping_min_delta: float = 0.0
 
     @classmethod
     def for_stage_a(
@@ -121,6 +197,7 @@ class TrainingSettings:
         optimizer = stage["optimizer"]
         scheduler = stage["scheduler"]
         loss = stage["loss"]
+        patience, min_delta = _early_stopping_from_config(common, stage)
         settings = cls(
             epochs=int(stage["epochs"]),
             batch_size=int(hardware["batch_size"]),
@@ -139,6 +216,8 @@ class TrainingSettings:
             model_profile=str(hardware.get("model_profile", "default")),
             hardware_profile=hardware_profile,
             log_every_steps=int(common.get("log_every_steps", 20)),
+            early_stopping_patience=patience,
+            early_stopping_min_delta=min_delta,
         )
         if overrides:
             settings = settings.replace(**overrides)
@@ -176,6 +255,7 @@ class TrainingSettings:
         optimizer = stage["optimizer"]
         scheduler = stage["scheduler"]
         loss = stage["loss"]
+        patience, min_delta = _early_stopping_from_config(common, stage)
         settings = cls(
             # Phase 2 counts steps, not epochs; one "epoch" is the whole budget.
             epochs=int(stage.get("epochs", 1)),
@@ -198,6 +278,8 @@ class TrainingSettings:
             hardware_profile=hardware_profile,
             log_every_steps=int(common.get("log_every_steps", 20)),
             anchor_source=str(stage.get("anchor_source", "oracle")),
+            early_stopping_patience=patience,
+            early_stopping_min_delta=min_delta,
         )
         if overrides:
             settings = settings.replace(**overrides)
@@ -402,6 +484,11 @@ class StageATrainer:
         self.history: list[EpochResult] = []
         self.best_dice = -1.0
         self.best_epoch = -1
+        self.early_stopping = EarlyStopping(
+            patience=settings.early_stopping_patience,
+            min_delta=settings.early_stopping_min_delta,
+        )
+        self.stopped_early = False
 
     # -- internals ---------------------------------------------------------
     def _to_device(self, batch: Mapping[str, Any]) -> dict[str, Any]:
@@ -533,6 +620,11 @@ class StageATrainer:
                 f"model: {sum(p.numel() for p in self.model.parameters()) / 1e6:.2f}M parameters "
                 f"({self.settings.model_profile} profile)"
             )
+            if self.settings.early_stopping_patience > 0:
+                print(
+                    f"early stopping: patience {self.settings.early_stopping_patience}, "
+                    f"min_delta {self.settings.early_stopping_min_delta}"
+                )
         with _training_logger(
             self.output_dir,
             self.settings,
@@ -556,6 +648,19 @@ class StageATrainer:
                     seconds=time.perf_counter() - started,
                 )
                 self.history.append(result)
+                if result.val_dice > self.best_dice:
+                    self.best_dice = result.val_dice
+                    self.best_epoch = epoch
+                    self.save("best.pt", result)
+                self.stopped_early = _should_stop_early(
+                    self.early_stopping,
+                    val_metrics=val_metrics,
+                    val_dice=result.val_dice,
+                    epoch=epoch,
+                    best_dice=self.best_dice,
+                    best_epoch=self.best_epoch,
+                    verbose=self.verbose,
+                )
                 logger.log_epoch(
                     epoch + 1,
                     metrics_from_stage_a(
@@ -566,10 +671,8 @@ class StageATrainer:
                     ),
                     result.learning_rate,
                 )
-                if result.val_dice > self.best_dice:
-                    self.best_dice = result.val_dice
-                    self.best_epoch = epoch
-                    self.save("best.pt", result)
+                if self.stopped_early:
+                    break
             logger.print_summary()
         self.save("last.pt", self.history[-1] if self.history else None)
         self.write_history()
@@ -588,6 +691,7 @@ class StageATrainer:
                 "best_dice": self.best_dice,
                 "best_epoch": self.best_epoch,
                 "class_names": list(self.class_names),
+                "stopped_early": self.stopped_early,
             },
         )
         return save_checkpoint(
@@ -698,6 +802,11 @@ class StageBTrainer:
         self.history: list[StageBEpochResult] = []
         self.best_dice = -1.0
         self.best_epoch = -1
+        self.early_stopping = EarlyStopping(
+            patience=settings.early_stopping_patience,
+            min_delta=settings.early_stopping_min_delta,
+        )
+        self.stopped_early = False
 
     # -- internals ---------------------------------------------------------
     def _to_device(self, batch: Mapping[str, Any]) -> dict[str, Any]:
@@ -868,6 +977,19 @@ class StageBTrainer:
                     seconds=time.perf_counter() - started,
                 )
                 self.history.append(result)
+                if result.val_dice > self.best_dice:
+                    self.best_dice = result.val_dice
+                    self.best_epoch = epoch
+                    self.save("best.pt", result)
+                self.stopped_early = _should_stop_early(
+                    self.early_stopping,
+                    val_metrics=val_metrics,
+                    val_dice=result.val_dice,
+                    epoch=epoch,
+                    best_dice=self.best_dice,
+                    best_epoch=self.best_epoch,
+                    verbose=self.verbose,
+                )
                 logger.log_epoch(
                     epoch + 1,
                     metrics_from_stage_b(
@@ -878,10 +1000,8 @@ class StageBTrainer:
                     ),
                     result.learning_rate,
                 )
-                if result.val_dice > self.best_dice:
-                    self.best_dice = result.val_dice
-                    self.best_epoch = epoch
-                    self.save("best.pt", result)
+                if self.stopped_early:
+                    break
             logger.print_summary()
         self.save("last.pt", self.history[-1] if self.history else None)
         self.write_history()
@@ -899,6 +1019,11 @@ class StageBTrainer:
             f"{getattr(getattr(self.model, 'config', None), 'variant', 'full')})"
         )
         print(f"anchors: {getattr(self.anchor_provider, 'source', 'oracle')}")
+        if self.settings.early_stopping_patience > 0:
+            print(
+                f"early stopping: patience {self.settings.early_stopping_patience}, "
+                f"min_delta {self.settings.early_stopping_min_delta}"
+            )
 
     def effective_precision(self) -> str:
         """What the loop actually runs in - autocast is dropped on CPU."""
@@ -924,6 +1049,7 @@ class StageBTrainer:
                 "best_dice": self.best_dice,
                 "best_epoch": self.best_epoch,
                 "anchors": provider_summary() if callable(provider_summary) else {},
+                "stopped_early": self.stopped_early,
             },
         )
         return save_checkpoint(

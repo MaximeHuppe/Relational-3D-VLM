@@ -33,6 +33,7 @@ from src.training.losses import (
     segmentation_loss,
 )
 from src.training.trainer import (
+    EarlyStopping,
     StageATrainer,
     TrainingSettings,
     build_scheduler,
@@ -272,6 +273,100 @@ def test_settings_resolve_from_the_hardware_profiles():
     smoke = TrainingSettings.for_stage_a(smoke=True)
     assert smoke.model_profile == "smoke" and smoke.epochs < laptop.epochs
     assert TrainingSettings.for_stage_a(overrides={"epochs": 3}).epochs == 3
+
+
+def test_early_stopping_requires_an_increase_larger_than_min_delta():
+    stopper = EarlyStopping(patience=2, min_delta=0.05)
+    assert stopper.update(0.10) is False
+    assert stopper.update(0.20) is False  # +0.10 counts
+    assert stopper.update(0.21) is False  # +0.01 does not; wait = 1
+    assert stopper.wait == 1
+    assert stopper.update(0.21) is True  # wait = 2, halt
+    assert stopper.stopped and stopper.best == pytest.approx(0.20)
+
+
+def test_early_stopping_resets_wait_after_a_real_improvement():
+    stopper = EarlyStopping(patience=2, min_delta=0.05)
+    assert stopper.update(0.10) is False
+    assert stopper.update(0.11) is False
+    assert stopper.wait == 1
+    assert stopper.update(0.20) is False
+    assert stopper.wait == 0
+    assert stopper.update(0.20) is False
+    assert stopper.update(0.20) is True
+
+
+def test_early_stopping_is_disabled_when_patience_is_zero():
+    stopper = EarlyStopping(patience=0, min_delta=0.5)
+    for score in (0.1, 0.1, 0.1, 0.1):
+        assert stopper.update(score) is False
+    assert not stopper.stopped
+
+
+def test_stage_a_settings_load_early_stopping_from_the_config():
+    settings = TrainingSettings.for_stage_a()
+    assert settings.early_stopping_patience > 0
+    assert settings.early_stopping_min_delta > 0.0
+    disabled = TrainingSettings.for_stage_a(overrides={"early_stopping_patience": 0})
+    assert disabled.early_stopping_patience == 0
+    assert TrainingSettings.for_stage_a(smoke=True).early_stopping_patience == 0
+
+
+def test_stage_a_fit_stops_when_val_dice_plateaus(tmp_path):
+    loader = torch.utils.data.DataLoader([{"unused": 0}])
+    settings = TrainingSettings(
+        epochs=20,
+        device="cpu",
+        warmup_epochs=0,
+        seed=0,
+        early_stopping_patience=2,
+        early_stopping_min_delta=0.05,
+    )
+    trainer = StageATrainer(
+        ShapeSegmenter(TINY),
+        settings,
+        loader,
+        loader,
+        class_names=SHAPE_NAMES,
+        output_dir=tmp_path,
+        verbose=False,
+    )
+    trainer.train_epoch = lambda epoch: (1.0, {"dice": 0.5}, 0.5)
+    scores = [0.10, 0.20, 0.21, 0.21, 0.90]
+    trainer.evaluate = lambda loader=None: {"mean": {"dice": scores.pop(0)}}
+    history = trainer.fit()
+    assert len(history) == 4
+    assert trainer.stopped_early
+    # Any increase still checkpoints; min_delta only gates the patience clock.
+    assert trainer.best_epoch == 2
+    assert trainer.best_dice == pytest.approx(0.21)
+    assert json.loads((tmp_path / "last.json").read_text())["extra"]["stopped_early"] is True
+
+
+def test_stage_a_fit_runs_the_full_schedule_without_validation(tmp_path):
+    loader = torch.utils.data.DataLoader([{"unused": 0}])
+    settings = TrainingSettings(
+        epochs=5,
+        device="cpu",
+        warmup_epochs=0,
+        seed=0,
+        early_stopping_patience=2,
+        early_stopping_min_delta=0.05,
+    )
+    trainer = StageATrainer(
+        ShapeSegmenter(TINY),
+        settings,
+        loader,
+        None,
+        class_names=SHAPE_NAMES,
+        output_dir=tmp_path,
+        verbose=False,
+    )
+    trainer.train_epoch = lambda epoch: (1.0, {"dice": 0.5}, 0.5)
+    trainer.evaluate = lambda loader=None: {}
+    history = trainer.fit()
+    assert len(history) == 5
+    assert not trainer.stopped_early
 
 
 def test_resolve_device_accepts_an_explicit_name():

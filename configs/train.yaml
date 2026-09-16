@@ -19,6 +19,12 @@ common:
     - git_revision
     - hardware
     - checkpoint_metadata
+  # Halt when validation Dice has not risen by more than `min_delta` for
+  # `patience` consecutive epochs. Set patience to 0 to run the full schedule.
+  # Per-stage blocks may override this (including smoke).
+  early_stopping:
+    patience: 5
+    min_delta: 0.01
 
 # Experiment tracking. Backend ``wandb`` mirrors per-epoch train/val losses and
 # metrics to Weights & Biases (and still writes runs/<name>/metrics.jsonl).
@@ -110,6 +116,7 @@ stage_a:
     optimizer: {name: adamw, lr: 0.002, weight_decay: 0.0}
     scheduler: {name: cosine, warmup_epochs: 1}
     hardware: {batch_size: 2, gradient_accumulation_steps: 1, model_profile: smoke}
+    early_stopping: {patience: 0}
 
 # Phase 2: relational overfit on a single scene (bug catcher).
 # One scene contributes every example whose target class the split allows, so
@@ -131,6 +138,7 @@ stage_b_overfit:
   smoke:
     steps: 150
     hardware: {batch_size: 2, gradient_accumulation_steps: 1, model_profile: smoke}
+    early_stopping: {patience: 0}
 
 # Phase 3: oracle-anchor training - the primary proof-of-concept measurement.
 stage_b_oracle:
@@ -152,6 +160,7 @@ stage_b_oracle:
     optimizer: {name: adamw, lr: 0.001, weight_decay: 0.0}
     scheduler: {name: cosine, warmup_epochs: 1}
     hardware: {batch_size: 2, gradient_accumulation_steps: 1, model_profile: smoke}
+    early_stopping: {patience: 0}
 
 # Phase 4: predicted-anchor evaluation (no retraining).
 # The trained Stage B checkpoint is re-run with `--anchor-source predicted`,
