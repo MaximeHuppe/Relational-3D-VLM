@@ -23,7 +23,7 @@ common:
   # `patience` consecutive epochs. Set patience to 0 to run the full schedule.
   # Per-stage blocks may override this (including smoke).
   early_stopping:
-    patience: 5
+    patience: 0
     min_delta: 0.01
 
 # Experiment tracking. Backend ``wandb`` mirrors per-epoch train/val losses and
@@ -32,8 +32,8 @@ common:
 logging:
   backend: wandb
   wandb:
-    project: relational-3d-vlm
-    tags: [relational-3d-vlm, augmentation, occupancy-volume, epoch30]
+    project: shape-segmenter
+    tags: [shape-segmenter, augmentation, occupancy-volume, dataset-custom, epoch50]
 
 hardware_profiles:
   laptop_mps:
@@ -73,7 +73,8 @@ hardware_profiles:
     precision: bf16
     # The data pipeline costs ~1 ms/sample against ~550 ms of compute, so worker
     # count does not affect throughput; 0 is simplest, >0 costs a one-off ~0.6 s
-    # spawn. Each persistent worker holds its own scene cache (~0.5 MB/scene).
+    # spawn. Each persistent worker holds its own scene cache (~0.79 MB/scene:
+    # the float16 normalised image plus the uint8 label volume).
     num_workers: 2
     # Hardware profile and model width are independent: the laptop can train the
     # full model, just slowly. The reduced model is selected by the per-stage
@@ -92,7 +93,7 @@ hardware_profiles:
 
 # Phase 1: Stage A pretraining on all ten shapes.
 stage_a:
-  epochs: 60
+  epochs: 50
   optimizer: {name: adamw, lr: 0.001, weight_decay: 0.00001}
   scheduler: {name: cosine, warmup_epochs: 2}
   loss:
