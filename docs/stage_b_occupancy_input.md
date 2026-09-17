@@ -54,7 +54,8 @@ channel is T1/T2. Instance maps and the target identity stay out.
 ## What the extra channel is (and is not)
 
 `scene_volume` is the image of the whole scene, containing **all ten** shapes,
-already stored per scene in `data/processed/scenes/<scene_id>/image.nii.gz`. It
+already stored per scene in `data/processed/scenes/<scene_id>/scene_volume.nii.gz`.
+It
 has **no instance ids**, no class colours, no target highlight, and its
 intensities are drawn independently of shape class so it cannot even say *what*
 a structure is. (When this was written it was the binary occupancy, whose schema

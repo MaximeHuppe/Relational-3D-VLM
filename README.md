@@ -78,14 +78,15 @@ takes roughly four minutes; generated volumes stay out of git.
 Each scene is a directory of NIfTI volumes plus a JSON record:
 
 ```text
-scenes/<scene_id>/
-  image.nii.gz                 the simulated MRI-like volume
-  labels.nii.gz                instance labels, 0 and 1..10
-  occupancy.nii.gz             binary foreground
-  masks/<id>_<name>.nii.gz     one binary mask per structure
-  examples/<example_id>_{target,anchors}.nii.gz + .json
-  scene.json                   seeds, placed parameters, appearance draws
+scenes/<scene_id>/scene_volume.nii.gz
+scenes/<scene_id>/instance_labels.nii.gz
+examples/<example_id>/target_mask.nii.gz
+examples/<example_id>/anchor_{slot}_{shape}.nii.gz
+examples/<example_id>/anchor_union.nii.gz
 ```
+
+That is the same layout `exp/realistic-appearance` loads, so `data/processed`
+can be copied into that worktree as-is.
 
 Redundant on purpose: any scene, or any single example, opens in ITK-SNAP,
 FSLeyes or 3D Slicer without deriving anything. The frame is RAS with a
@@ -157,7 +158,7 @@ from is one flag:
 
 | `--anchor-source` | Three channels are |
 | --- | --- |
-| `oracle` (default) | the ground-truth masks: `data/processed/scenes/<scene>/labels.nii.gz` with everything but the three named anchor structures dropped |
+| `oracle` (default) | the ground-truth masks: `data/processed/scenes/<scene>/instance_labels.nii.gz` with everything but the three named anchor structures dropped |
 | `predicted` | Stage A's segmentation of those same three shape names, in prompt order |
 
 A predicted run also reports the anchor masks' own Dice/IoU, so a drop against

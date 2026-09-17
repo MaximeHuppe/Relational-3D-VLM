@@ -24,14 +24,13 @@ from src.data.primitives import SHAPE_NAMES  # noqa: E402
 from src.data.direction_rules import DIRECTION_RULE_VERSION  # noqa: E402
 from src.data.nifti_io import load_nifti  # noqa: E402
 from src.data.scene_io import (  # noqa: E402
-    IMAGE_FILE,
-    LABELS_FILE,
-    MASK_DIR,
-    OCCUPANCY_FILE,
-    SCENE_RECORD,
+    ANCHOR_UNION_FILE,
+    INSTANCE_LABELS_FILE,
+    SCENE_VOLUME_FILE,
+    TARGET_MASK_FILE,
+    anchor_mask_filename,
+    example_directory,
     load_scene,
-    load_scene_record,
-    mask_filename,
     scene_directory,
     scene_path,
 )
@@ -65,10 +64,12 @@ def test_scene_arrays_and_manifests_are_written(dataset):
     scenes = scene_dirs(root)
     assert len(scenes) == 3  # one scene per split
     for directory in scenes:
-        for name in (IMAGE_FILE, LABELS_FILE, OCCUPANCY_FILE, SCENE_RECORD):
+        for name in (SCENE_VOLUME_FILE, INSTANCE_LABELS_FILE):
             assert (directory / name).is_file(), f"{directory.name} is missing {name}"
-        masks = sorted((directory / MASK_DIR).glob("*.nii.gz"))
-        assert len(masks) == len(SHAPE_NAMES)
+        assert {path.name for path in directory.iterdir()} == {
+            SCENE_VOLUME_FILE,
+            INSTANCE_LABELS_FILE,
+        }
     for split in ("train", "val", "test"):
         assert (root / "manifests" / f"{split}.jsonl").is_file()
         assert (root / "manifests" / f"{split}_candidates.jsonl").is_file()
@@ -103,46 +104,42 @@ def test_the_image_is_an_mri_like_volume_not_the_binary_occupancy(dataset):
         assert float((background > 0.2 * float(image.max())).mean()) > 0.4
 
 
-def test_per_structure_masks_match_the_label_volume(dataset):
+def test_every_instance_is_present_in_the_label_volume(dataset):
     _, root = dataset
     for path in scene_dirs(root):
         labels = load_scene(path).instance_labels
         for instance_id in range(1, len(SHAPE_NAMES) + 1):
-            mask, spacing = load_nifti(path / MASK_DIR / mask_filename(instance_id), dtype=np.uint8)
-            assert np.array_equal(mask.astype(bool), labels == instance_id)
-            assert spacing == (1.0, 1.0, 1.0)
+            assert (labels == instance_id).any(), f"{path.name} is missing instance {instance_id}"
 
 
-def test_scene_json_describes_the_scene_and_its_appearance(dataset):
-    _, root = dataset
-    for path in scene_dirs(root):
-        record = load_scene_record(path)
-        assert record["array_order"] == "(z, y, x)"
-        assert record["volume_shape_zyx"] == [64, 64, 64]
-        assert len(record["examples"]) == 10
-        assert set(record["structures"]) == set(SHAPE_NAMES)
-        appearance = record["appearance"]
-        assert appearance["noise_sigma"] > 0
-        # Intensities must not encode the shape class, or the target could be
-        # recognised from its grey level instead of from the three relations.
-        assert appearance["class_conditioned_intensities"] is False
-        assert appearance["measured"]["contrast_to_noise"] > 1.0
+def test_run_metadata_records_appearance_without_class_conditioned_intensities(dataset):
+    run, root = dataset
+    record = json.loads((root / "run_metadata.json").read_text(encoding="utf-8"))
+    appearance = record["appearance"]
+    assert appearance["enabled"] is True
+    assert appearance["class_conditioned_intensities"] is False
+    assert appearance["measured"]["contrast_to_noise"]["min"] > 1.0
+    assert run.splits["train"].scenes == 1
 
 
 def test_per_example_target_and_anchor_volumes_are_written(dataset):
     _, root = dataset
     for metadata in read_manifest(root / "manifests" / "train_candidates.jsonl"):
-        directory = scene_directory(root, metadata.scene_id) / "examples"
+        directory = example_directory(root, metadata.example_id)
         labels = load_scene(scene_path(root, metadata.scene_id)).instance_labels
-        target, _ = load_nifti(directory / f"{metadata.example_id}_target.nii.gz", dtype=np.uint8)
-        anchors, _ = load_nifti(directory / f"{metadata.example_id}_anchors.nii.gz", dtype=np.uint8)
+        target, _ = load_nifti(directory / TARGET_MASK_FILE, dtype=np.uint8)
+        union, _ = load_nifti(directory / ANCHOR_UNION_FILE, dtype=np.uint8)
         assert np.array_equal(target.astype(bool), labels == metadata.target_instance_id)
-        assert anchors.shape == (3,) + labels.shape
-        for slot, instance_id in enumerate(metadata.anchor_instance_ids):
-            assert np.array_equal(anchors[slot].astype(bool), labels == instance_id)
-        assert json.loads(
-            (directory / f"{metadata.example_id}.json").read_text(encoding="utf-8")
-        )["prompt"] == metadata.prompt
+        stacked = []
+        for slot, (instance_id, shape_name) in enumerate(
+            zip(metadata.anchor_instance_ids, metadata.anchor_shape_names)
+        ):
+            mask, _ = load_nifti(
+                directory / anchor_mask_filename(slot, shape_name), dtype=np.uint8
+            )
+            assert np.array_equal(mask.astype(bool), labels == instance_id)
+            stacked.append(mask)
+        assert np.array_equal(union.astype(bool), np.any(np.stack(stacked).astype(bool), axis=0))
 
 
 def test_candidates_hold_all_ten_targets_and_manifests_are_filtered(dataset):

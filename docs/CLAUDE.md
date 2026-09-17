@@ -105,7 +105,7 @@ Use rejection sampling:
 
 There is no required minimum separation beyond non-overlap. If packing repeatedly fails at `64^3`, regenerate the scene with new parameters first. Do not silently omit or duplicate an object. If a configurable maximum number of scene attempts is exhausted, increase all three dimensions together (for example `72^3`, then `80^3`) and record the actual `volume_shape`; the output/crop contract must still be explicit.
 
-Save `image` (the simulated MRI-like volume), `scene_volume` (binary foreground/background) and `instance_labels` (zero background plus one distinct label for each shape). Scenes are written as NIfTI (`.nii.gz`) directories in a RAS frame, together with one binary mask per structure, the per-example target and ordered anchor channels, and a `scene.json` recording the seeds, the placed parameters and every appearance draw. See `docs/dataset_schema.md`.
+Save `image` (the simulated MRI-like volume, written as `scene_volume.nii.gz`), the binary foreground (derived from labels at load time) and `instance_labels` (written as `instance_labels.nii.gz`). Per-example inspection files are `examples/<example_id>/{target_mask,anchor_{slot}_{shape},anchor_union}.nii.gz`. See `docs/dataset_schema.md`.
 
 Structures must be placed inside the simulated head, not in the air around it.
 

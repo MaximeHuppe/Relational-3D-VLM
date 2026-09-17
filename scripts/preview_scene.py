@@ -32,7 +32,9 @@ import numpy as np  # noqa: E402
 from src.data.primitives import SHAPE_VOCABULARY  # noqa: E402
 from src.data.scene_io import (  # noqa: E402
     EXAMPLE_DIR,
+    TARGET_MASK_FILE,
     SceneVolumes,
+    example_directory,
     iter_scene_directories,
     load_scene,
     scene_directory,
@@ -251,15 +253,29 @@ def render_scene(
 
 
 def example_arrays(root: Path, scene_id: str, example_id: str) -> tuple[np.ndarray, np.ndarray]:
-    """Read one example's stored target and anchor stack, else derive them."""
+    """Read one example's stored target and ordered anchors, else derive them."""
     from src.data.nifti_io import load_nifti
 
-    directory = scene_directory(root, scene_id) / EXAMPLE_DIR
-    target_path = directory / f"{example_id}_target.nii.gz"
-    anchors_path = directory / f"{example_id}_anchors.nii.gz"
-    if target_path.is_file() and anchors_path.is_file():
+    directory = example_directory(root, example_id)
+    target_path = directory / TARGET_MASK_FILE
+    if target_path.is_file():
         target, _ = load_nifti(target_path, dtype=np.uint8)
-        anchors, _ = load_nifti(anchors_path, dtype=np.uint8)
+        anchors = []
+        for slot in range(3):
+            matches = sorted(directory.glob(f"anchor_{slot}_*.nii.gz"))
+            if not matches:
+                break
+            mask, _ = load_nifti(matches[0], dtype=np.uint8)
+            anchors.append(mask)
+        if len(anchors) == 3:
+            return target, np.stack(anchors)
+
+    nested = scene_directory(root, scene_id) / EXAMPLE_DIR
+    nested_target = nested / f"{example_id}_target.nii.gz"
+    nested_anchors = nested / f"{example_id}_anchors.nii.gz"
+    if nested_target.is_file() and nested_anchors.is_file():
+        target, _ = load_nifti(nested_target, dtype=np.uint8)
+        anchors, _ = load_nifti(nested_anchors, dtype=np.uint8)
         return target, anchors
 
     labels = load_scene(scene_directory(root, scene_id)).instance_labels

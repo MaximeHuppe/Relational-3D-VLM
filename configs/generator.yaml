@@ -45,23 +45,31 @@ examples:
   examples_per_scene: 10
 
 storage:
-  root: data/processed
-  # A scene is a directory of NIfTI volumes: the simulated image, the instance
-  # labels, the binary occupancy and one mask per structure, plus scene.json
-  # with the seeds, the placed parameters and every appearance draw. Example
-  # records reference their scene and carry all metadata; the loader still
-  # re-runs the channel/order consistency checks. See docs/dataset_schema.md.
+  root: data/dataset_mri
+  # A scene directory holds only the two shared volumes the other branch
+  # already loads:
+  #
+  #   scenes/<scene_id>/scene_volume.nii.gz
+  #   scenes/<scene_id>/instance_labels.nii.gz
+  #   examples/<example_id>/target_mask.nii.gz
+  #   examples/<example_id>/anchor_{slot}_{shape}.nii.gz
+  #   examples/<example_id>/anchor_union.nii.gz
+  #
+  # Example records live in the JSONL manifests. The loader rematerialises
+  # masks from instance_labels and re-runs the channel/order checks.
+  # See docs/dataset_schema.md.
   #
   # `npz_compressed` restores the single-file form of the previous milestone
   # (scene_volume + instance_labels + image in one .npz). Both are readable by
   # src.data.scene_io.load_scene, so an old corpus keeps working.
   scene_array_format: nifti
-  # Also write, per retained example, its target mask and its three ordered
-  # anchor channels as a 4D volume, next to a JSON copy of its prompt record.
-  # Redundant with the per-structure masks, and on by default because it makes
-  # a single example openable in a viewer without deriving anything.
+  # Also write, per retained example, its target mask, three ordered anchor
+  # masks and their union under examples/<example_id>/. Redundant with the
+  # label volume; on by default so a copied corpus matches the inspection
+  # files exp/realistic-appearance already writes.
   write_example_masks: true
-  # On-disk type of image.nii.gz. `uint16` is what a scanner writes: nibabel
+  # On-disk type of scene_volume.nii.gz. `uint16`
+  # is what a scanner writes: nibabel
   # stores a scale factor in the header, so the volume reads back in its
   # simulated units, at half the size of float32 and with a quantisation error
   # (~1e-5) three orders of magnitude below the noise. `float32` stores the

@@ -120,17 +120,11 @@ the scene and logs the rejection reason.
 
 ```text
 data/processed/
-  scenes/<scene_id>/
-    image.nii.gz                     # the simulated MRI-like volume
-    labels.nii.gz                    # instance labels, 0 and 1..10 (uint8)
-    occupancy.nii.gz                 # binary foreground (uint8)
-    masks/<id>_<name>.nii.gz         # one binary mask per structure (10)
-    examples/<example_id>_target.nii.gz    # that example's target mask
-    examples/<example_id>_anchors.nii.gz   # its 3 anchor channels, 4D, clause order
-    examples/<example_id>.json             # its prompt record
-    scene.json                       # seeds, placed parameters, appearance draws
-    tissue.nii.gz, bias_field.nii.gz,      # --write-appearance-diagnostics
-    structure_fraction.nii.gz, body_mask.nii.gz
+  scenes/<scene_id>/scene_volume.nii.gz      # the simulated MRI-like volume
+  scenes/<scene_id>/instance_labels.nii.gz   # instance labels, 0 and 1..10 (uint8)
+  examples/<example_id>/target_mask.nii.gz
+  examples/<example_id>/anchor_{slot}_{shape}.nii.gz
+  examples/<example_id>/anchor_union.nii.gz
   manifests/<split>.jsonl            # one ExampleMetadata per retained example
   manifests/<split>_candidates.jsonl # all ten candidates (--keep-all-candidates)
   run_metadata.json                  # configs, seeds, versions, git revision,
@@ -139,12 +133,10 @@ data/processed/
 data/smoke/                          # same layout, written by the smoke run
 ```
 
-Everything under a scene directory except `labels.nii.gz` and `image.nii.gz` is
-derivable from those two. It is written anyway: the point is that any scene, or
-any single example, opens in ITK-SNAP, FSLeyes or 3D Slicer, or loads with three
-lines of `nibabel`, without re-deriving anything or importing this package.
-`storage.write_example_masks: false` drops the per-example volumes if the file
-count becomes a nuisance.
+This is the same tree `exp/realistic-appearance` writes, so `data/processed`
+can be copied into that worktree as-is. Occupancy and per-structure masks are
+derived from `instance_labels.nii.gz` at load time. `storage.write_example_masks:
+false` drops the per-example volumes if the file count becomes a nuisance.
 
 **NIfTI orientation.** Arrays are `(z, y, x)` in memory and `(i, j, k)` in a
 NIfTI file, so `src.data.nifti_io` transposes on the way out and back on the way
@@ -153,7 +145,7 @@ voxel's NIfTI world coordinate exactly the world coordinate this codebase
 computes for it — a centroid printed by a manifest can be typed straight into a
 viewer. Both `sform` and `qform` are set, and `aff2axcodes` gives `(R, A, S)`.
 
-`image.nii.gz` is stored as `uint16` with a header scale factor, which is how
+`scene_volume.nii.gz` is stored as `uint16` with a header scale factor, which is how
 scanner data is written: it halves the file and reads back in the simulated
 units to within ~1e-5, three orders of magnitude below the noise.
 `storage.image_dtype: float32` stores it bit-exactly instead.

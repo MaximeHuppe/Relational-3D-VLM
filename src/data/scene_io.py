@@ -1,38 +1,33 @@
-"""On-disk layout of a generated scene.
+"""On-disk layout of a generated corpus.
 
-A scene is a directory of NIfTI volumes plus one JSON record::
+The tree matches ``exp/realistic-appearance`` so ``data/processed`` can be
+copied into that worktree as-is::
 
-    scenes/<scene_id>/
-        image.nii.gz                 the simulated MRI-like volume; uint16
-                                     with a header scale factor by default, so
-                                     it reads back in its simulated units
-        labels.nii.gz                uint8    instance labels, 0 and 1..10
-        occupancy.nii.gz             uint8    binary union of the ten structures
-        masks/<id>_<name>.nii.gz     uint8    one binary mask per structure
-        tissue.nii.gz                float32  noise-free tissue map    (optional)
-        bias_field.nii.gz            float32  receive-coil gain        (optional)
-        structure_fraction.nii.gz    float32  total partial volume     (optional)
-        body_mask.nii.gz             uint8    head outline             (optional)
-        examples/<example_id>_target.nii.gz   uint8    (optional)
-        examples/<example_id>_anchors.nii.gz  uint8 4D (optional)
-        examples/<example_id>.json            the example's prompt record
-        scene.json                   seeds, versions, geometry, appearance draws
+    scenes/<scene_id>/scene_volume.nii.gz
+    scenes/<scene_id>/instance_labels.nii.gz
+    examples/<example_id>/target_mask.nii.gz
+    examples/<example_id>/anchor_{slot}_{shape}.nii.gz
+    examples/<example_id>/anchor_union.nii.gz
+    manifests/<split>.jsonl
+    manifests/<split>_candidates.jsonl
+    run_metadata.json
 
-Everything is redundant on purpose. ``labels.nii.gz`` alone determines
-``occupancy``, every per-structure mask and every example's target and anchor
-channels, but writing them out means any scene can be opened in a viewer, or
-loaded by an analysis script, without re-deriving anything or importing this
-package.
+``scene_volume.nii.gz`` is the simulated MRI-like image (uint16 with a header
+scale factor by default). ``instance_labels.nii.gz`` is uint8 labels 0 and
+1..10. Occupancy, per-structure masks and every example channel are derivable
+from the labels; they are written under ``examples/`` for inspection, and the
+loader rematerialises them either way.
 
-The previous single-file format (``scenes/<scene_id>.npz`` holding
-``scene_volume`` and ``instance_labels``) is still readable: :func:`load_scene`
-dispatches on what is actually on disk, so a corpus generated before this
-change keeps working and simply has no ``image``.
+An older nested layout (``image.nii.gz`` / ``labels.nii.gz``, ``occupancy``,
+``masks/``, ``scenes/<id>/examples/``) is still readable. The previous
+single-file ``scenes/<scene_id>.npz`` form is too.
 """
 
 from __future__ import annotations
 
 import json
+import os
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -46,6 +41,12 @@ from src.data.primitives import SHAPE_VOCABULARY
 NIFTI_FORMAT = "nifti"
 NPZ_FORMAT = "npz_compressed"
 
+#: Canonical names, matching ``exp/realistic-appearance``.
+SCENE_VOLUME_FILE = "scene_volume" + NIFTI_SUFFIX
+INSTANCE_LABELS_FILE = "instance_labels" + NIFTI_SUFFIX
+TARGET_MASK_FILE = "target_mask" + NIFTI_SUFFIX
+ANCHOR_UNION_FILE = "anchor_union" + NIFTI_SUFFIX
+#: Older short names; still read, no longer written.
 IMAGE_FILE = "image" + NIFTI_SUFFIX
 LABELS_FILE = "labels" + NIFTI_SUFFIX
 OCCUPANCY_FILE = "occupancy" + NIFTI_SUFFIX
@@ -129,7 +130,7 @@ def scene_path(root: Path | str, scene_id: str) -> Path:
         SceneIOError: neither form exists.
     """
     directory = scene_directory(root, scene_id)
-    if (directory / LABELS_FILE).is_file():
+    if _labels_path(directory) is not None:
         return directory
     legacy = legacy_scene_path(root, scene_id)
     if legacy.is_file():
@@ -138,8 +139,142 @@ def scene_path(root: Path | str, scene_id: str) -> Path:
 
 
 def mask_filename(instance_id: int) -> str:
-    """``masks/`` entry of one structure, named by ID and shape."""
+    """Older ``masks/`` entry of one structure, named by ID and shape."""
     return f"{int(instance_id):02d}_{SHAPE_VOCABULARY.id_to_name(int(instance_id))}{NIFTI_SUFFIX}"
+
+
+def example_directory(root: Path | str, example_id: str) -> Path:
+    """Directory holding one example's inspection NIfTIs."""
+    return Path(root) / EXAMPLE_DIR / example_id
+
+
+def anchor_mask_filename(slot: int, shape_name: str) -> str:
+    """``examples/<example_id>/anchor_{slot}_{shape}.nii.gz``."""
+    return f"anchor_{int(slot)}_{shape_name}{NIFTI_SUFFIX}"
+
+
+def _first_file(directory: Path, names: Sequence[str]) -> Path | None:
+    for name in names:
+        path = directory / name
+        if path.is_file():
+            return path
+    return None
+
+
+def _labels_path(directory: Path) -> Path | None:
+    return _first_file(directory, (INSTANCE_LABELS_FILE, LABELS_FILE))
+
+
+def _image_path(directory: Path) -> Path | None:
+    return _first_file(directory, (SCENE_VOLUME_FILE, IMAGE_FILE))
+
+
+def _link_alias(canonical: Path, alias: Path) -> None:
+    """Make ``alias`` refer to the same bytes as ``canonical``."""
+    if alias == canonical:
+        return
+    if alias.exists() or alias.is_symlink():
+        if canonical.exists() and alias.exists() and alias.samefile(canonical):
+            return
+        alias.unlink()
+    try:
+        os.link(canonical, alias)
+    except OSError:
+        shutil.copy2(canonical, alias)
+
+
+def ensure_scene_name_aliases(directory: Path | str, *, replace: bool = False) -> None:
+    """Fill in ``scene_volume`` / ``instance_labels`` from older short names.
+
+    Used when relayouting a corpus that still has ``image.nii.gz`` /
+    ``labels.nii.gz`` so the shared names exist before extras are stripped.
+    """
+    directory = Path(directory)
+    pairs = (
+        (SCENE_VOLUME_FILE, IMAGE_FILE),
+        (INSTANCE_LABELS_FILE, LABELS_FILE),
+    )
+    for canonical_name, alias_name in pairs:
+        canonical = directory / canonical_name
+        alias = directory / alias_name
+        if replace:
+            if canonical.is_file():
+                _link_alias(canonical, alias)
+            elif alias.is_file():
+                _link_alias(alias, canonical)
+            continue
+        if canonical.is_file() and not alias.is_file():
+            _link_alias(canonical, alias)
+        elif alias.is_file() and not canonical.is_file():
+            _link_alias(alias, canonical)
+
+
+def alias_scene_corpus(root: Path | str) -> int:
+    """Ensure every scene directory has the shared volume names.
+
+    Returns the number of scene directories visited.
+    """
+    count = 0
+    for directory in iter_scene_directories(root):
+        ensure_scene_name_aliases(directory, replace=False)
+        count += 1
+    return count
+
+
+def _strip_scene_extras(directory: Path) -> None:
+    """Leave only ``scene_volume.nii.gz`` and ``instance_labels.nii.gz``."""
+    keep = {SCENE_VOLUME_FILE, INSTANCE_LABELS_FILE}
+    for child in list(directory.iterdir()):
+        if child.name in keep:
+            continue
+        if child.is_dir():
+            shutil.rmtree(child)
+        elif child.exists() or child.is_symlink():
+            child.unlink()
+
+
+def relayout_corpus(root: Path | str) -> dict[str, int]:
+    """Rewrite an older nested corpus into the shared on-disk layout.
+
+    Ensures ``scene_volume.nii.gz`` / ``instance_labels.nii.gz``, writes
+    ``examples/<example_id>/{target_mask,anchor_*,anchor_union}.nii.gz`` from
+    the manifests, and strips occupancy, masks, nested examples and short
+    aliases from each scene directory.
+
+    Returns counts of scenes and examples rewritten.
+    """
+    from src.data.schema import read_manifest
+
+    root = Path(root)
+    n_scenes = alias_scene_corpus(root)
+    by_scene: dict[str, list[Any]] = {}
+    for split in ("train", "val", "test"):
+        for name in (f"{split}.jsonl", f"{split}_candidates.jsonl"):
+            path = root / "manifests" / name
+            if not path.is_file():
+                continue
+            for metadata in read_manifest(path):
+                by_scene.setdefault(metadata.scene_id, []).append(metadata)
+    n_examples = 0
+    seen: set[str] = set()
+    for scene_id, metadatas in by_scene.items():
+        volumes = load_scene(scene_directory(root, scene_id))
+        for metadata in metadatas:
+            if metadata.example_id in seen:
+                continue
+            seen.add(metadata.example_id)
+            save_example_masks(
+                root,
+                metadata.example_id,
+                instance_labels=volumes.instance_labels,
+                target_instance_id=metadata.target_instance_id,
+                anchor_instance_ids=metadata.anchor_instance_ids,
+                anchor_shape_names=metadata.anchor_shape_names,
+                spacing=volumes.spacing,
+            )
+            n_examples += 1
+        _strip_scene_extras(scene_directory(root, scene_id))
+    return {"scenes": n_scenes, "examples": n_examples}
 
 
 # ---------------------------------------------------------------------------
@@ -155,26 +290,32 @@ def save_scene(
     image: np.ndarray | None = None,
     record: Mapping[str, Any] | None = None,
     extra_volumes: Mapping[str, np.ndarray] | None = None,
-    write_structure_masks: bool = True,
+    write_structure_masks: bool = False,
+    inspection_extras: bool = False,
     image_dtype: np.dtype | str = np.uint16,
 ) -> Path:
-    """Write one scene as a directory of NIfTI volumes plus ``scene.json``.
+    """Write one scene as ``scene_volume.nii.gz`` and ``instance_labels.nii.gz``.
 
     Args:
         root: the dataset root; the scene lands in ``<root>/scenes/<scene_id>``.
         scene_id: the scene's identifier.
         instance_labels: ``(D, H, W)`` labels, 0 background and 1..10 instances.
-        occupancy: ``(D, H, W)`` binary foreground.
+        occupancy: ``(D, H, W)`` binary foreground. Written only with
+            ``inspection_extras``.
         spacing: world units per voxel, ordered ``(x, y, z)``.
         image: the simulated MRI-like volume, when the corpus has one.
-        image_dtype: on-disk type of ``image.nii.gz``. An integer type makes
-            nibabel store a header scale factor, which is how scanner data is
-            written and halves the file; the volume still reads back in its
-            simulated units.
-        record: JSON-serialisable scene record written to ``scene.json``.
+        image_dtype: on-disk type of ``scene_volume.nii.gz``. An integer type
+            makes nibabel store a header scale factor, which is how scanner
+            data is written and halves the file; the volume still reads back
+            in its simulated units.
+        record: JSON-serialisable scene record written to ``scene.json`` when
+            ``inspection_extras`` is on.
         extra_volumes: optional diagnostics keyed by file name, for example
             ``{"tissue.nii.gz": ...}``.
         write_structure_masks: also write one binary mask per structure.
+        inspection_extras: also write occupancy, short-name aliases, per-structure
+            masks and ``scene.json``. Off by default so a copy of the corpus
+            matches ``exp/realistic-appearance``.
 
     Returns:
         The scene directory.
@@ -183,22 +324,41 @@ def save_scene(
     directory.mkdir(parents=True, exist_ok=True)
     labels = np.asarray(instance_labels, dtype=np.uint8)
 
-    save_nifti(directory / LABELS_FILE, labels, spacing, dtype=np.uint8, description="instance labels 0-10")
     save_nifti(
-        directory / OCCUPANCY_FILE,
-        np.asarray(occupancy, dtype=np.uint8),
+        directory / INSTANCE_LABELS_FILE,
+        labels,
         spacing,
         dtype=np.uint8,
-        description="binary foreground",
+        description="instance labels 0-10",
     )
     if image is not None:
         save_nifti(
-            directory / IMAGE_FILE,
+            directory / SCENE_VOLUME_FILE,
             np.asarray(image, dtype=np.float32),
             spacing,
             dtype=np.dtype(image_dtype),
             description="simulated MRI-like volume",
         )
+    else:
+        leftover = directory / SCENE_VOLUME_FILE
+        if leftover.exists() or leftover.is_symlink():
+            leftover.unlink()
+
+    if inspection_extras:
+        save_nifti(
+            directory / OCCUPANCY_FILE,
+            np.asarray(occupancy, dtype=np.uint8),
+            spacing,
+            dtype=np.uint8,
+            description="binary foreground",
+        )
+        ensure_scene_name_aliases(directory, replace=True)
+        write_structure_masks = True
+        if record is not None:
+            (directory / SCENE_RECORD).write_text(
+                json.dumps(dict(record), indent=2, sort_keys=True) + "\n", encoding="utf-8"
+            )
+
     for name, volume in (extra_volumes or {}).items():
         array = np.asarray(volume)
         dtype = np.uint8 if array.dtype == np.uint8 else np.float32
@@ -215,54 +375,60 @@ def save_scene(
                 dtype=np.uint8,
                 description=f"{spec.name} (instance {spec.id})",
             )
-
-    if record is not None:
-        (directory / SCENE_RECORD).write_text(
-            json.dumps(dict(record), indent=2, sort_keys=True) + "\n", encoding="utf-8"
-        )
     return directory
 
 
 def save_example_masks(
     root: Path | str,
-    scene_id: str,
     example_id: str,
     *,
     instance_labels: np.ndarray,
     target_instance_id: int,
     anchor_instance_ids: Sequence[int],
+    anchor_shape_names: Sequence[str],
     spacing: Sequence[float] = (1.0, 1.0, 1.0),
-    record: Mapping[str, Any] | None = None,
 ) -> Path:
-    """Write one example's target mask, ordered anchor stack and prompt record.
+    """Write one example under ``examples/<example_id>/``.
 
-    The anchor stack is a 4D volume whose fourth dimension is the clause slot,
-    so opening it shows the three anchors in prompt order as a volume series.
+    Files::
+
+        target_mask.nii.gz
+        anchor_{slot}_{shape}.nii.gz   one per clause, prompt order
+        anchor_union.nii.gz
     """
-    directory = scene_directory(root, scene_id) / EXAMPLE_DIR
+    if len(anchor_instance_ids) != len(anchor_shape_names):
+        raise SceneIOError(
+            f"anchor_instance_ids ({len(anchor_instance_ids)}) and "
+            f"anchor_shape_names ({len(anchor_shape_names)}) must be the same length"
+        )
+    directory = example_directory(root, example_id)
     directory.mkdir(parents=True, exist_ok=True)
     labels = np.asarray(instance_labels)
     save_nifti(
-        directory / f"{example_id}_target{NIFTI_SUFFIX}",
+        directory / TARGET_MASK_FILE,
         (labels == int(target_instance_id)).astype(np.uint8),
         spacing,
         dtype=np.uint8,
         description="target mask (label, never a model input)",
     )
-    anchors = np.stack(
-        [(labels == int(instance_id)).astype(np.uint8) for instance_id in anchor_instance_ids]
-    )
+    union = np.zeros(labels.shape, dtype=np.uint8)
+    for slot, (instance_id, shape_name) in enumerate(zip(anchor_instance_ids, anchor_shape_names)):
+        mask = (labels == int(instance_id)).astype(np.uint8)
+        union = np.maximum(union, mask)
+        save_nifti(
+            directory / anchor_mask_filename(slot, shape_name),
+            mask,
+            spacing,
+            dtype=np.uint8,
+            description=f"anchor slot {slot} ({shape_name})",
+        )
     save_nifti(
-        directory / f"{example_id}_anchors{NIFTI_SUFFIX}",
-        anchors,
+        directory / ANCHOR_UNION_FILE,
+        union,
         spacing,
         dtype=np.uint8,
-        description="ordered anchor channels, 4th dim = clause slot",
+        description="union of the three ordered anchor channels",
     )
-    if record is not None:
-        (directory / f"{example_id}.json").write_text(
-            json.dumps(dict(record), indent=2, sort_keys=True) + "\n", encoding="utf-8"
-        )
     return directory
 
 
@@ -277,15 +443,19 @@ def load_scene(path: Path | str) -> SceneVolumes:
     """
     path = Path(path)
     if path.is_dir():
-        labels, spacing = load_nifti(path / LABELS_FILE, dtype=np.uint8)
+        labels_path = _labels_path(path)
+        if labels_path is None:
+            raise SceneIOError(f"missing instance labels under {path}")
+        labels, spacing = load_nifti(labels_path, dtype=np.uint8)
         occupancy_path = path / OCCUPANCY_FILE
         if occupancy_path.is_file():
             occupancy, _ = load_nifti(occupancy_path, dtype=np.uint8)
-        else:  # pragma: no cover - occupancy is always written
+        else:
             occupancy = (labels != 0).astype(np.uint8)
         image = None
-        if (path / IMAGE_FILE).is_file():
-            image, _ = load_nifti(path / IMAGE_FILE, dtype=np.float32)
+        image_path = _image_path(path)
+        if image_path is not None:
+            image, _ = load_nifti(image_path, dtype=np.float32)
         return SceneVolumes(
             instance_labels=labels, occupancy=occupancy, image=image, spacing=spacing
         )
@@ -318,30 +488,39 @@ def iter_scene_directories(root: Path | str) -> Iterable[Path]:
     scenes = Path(root) / "scenes"
     if not scenes.is_dir():
         return []
-    return sorted(path for path in scenes.iterdir() if (path / LABELS_FILE).is_file())
+    return sorted(path for path in scenes.iterdir() if _labels_path(path) is not None)
 
 
 __all__ = [
+    "ANCHOR_UNION_FILE",
     "BODY_FILE",
     "BIAS_FILE",
     "EXAMPLE_DIR",
     "FRACTION_FILE",
     "IMAGE_FILE",
+    "INSTANCE_LABELS_FILE",
     "LABELS_FILE",
     "MASK_DIR",
     "NIFTI_FORMAT",
     "NPZ_FORMAT",
     "OCCUPANCY_FILE",
     "SCENE_RECORD",
+    "SCENE_VOLUME_FILE",
+    "TARGET_MASK_FILE",
     "TISSUE_FILE",
     "SceneIOError",
     "SceneVolumes",
+    "alias_scene_corpus",
+    "anchor_mask_filename",
+    "ensure_scene_name_aliases",
+    "example_directory",
     "iter_scene_directories",
     "legacy_scene_path",
     "load_scene",
     "load_scene_record",
     "load_structure_mask",
     "mask_filename",
+    "relayout_corpus",
     "save_example_masks",
     "save_scene",
     "scene_affine",

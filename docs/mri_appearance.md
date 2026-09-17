@@ -147,7 +147,7 @@ checks the second point directly.
 ## Turning it off
 
 `enabled: false` in `configs/appearance.yaml` restores the previous milestone:
-binary volumes, no `image.nii.gz`, and the datasets fall back to the occupancy
+binary volumes, no `scene_volume.nii.gz`, and the datasets fall back to the occupancy
 automatically. On a corpus that *does* have an image, `image_source="occupancy"`
 on `SceneDataset` / `ExampleDataset` gives the same binary input without
 regenerating anything — that is the baseline to compare an appearance-trained

@@ -9,8 +9,6 @@ viewer while every in-memory test still passed.
 
 from __future__ import annotations
 
-import json
-
 import numpy as np
 import pytest
 
@@ -26,12 +24,19 @@ from src.data.nifti_io import (
 from src.data.primitives import SHAPE_VOCABULARY
 from src.data.scene_generator import generate_scene, scene_record
 from src.data.scene_io import (
+    ANCHOR_UNION_FILE,
     IMAGE_FILE,
+    INSTANCE_LABELS_FILE,
     LABELS_FILE,
     MASK_DIR,
     OCCUPANCY_FILE,
     SCENE_RECORD,
+    SCENE_VOLUME_FILE,
+    TARGET_MASK_FILE,
     SceneIOError,
+    anchor_mask_filename,
+    ensure_scene_name_aliases,
+    example_directory,
     load_scene,
     load_scene_record,
     load_structure_mask,
@@ -124,14 +129,51 @@ def test_a_missing_volume_fails_with_its_path(tmp_path):
 # ---------------------------------------------------------------------------
 # The scene directory
 # ---------------------------------------------------------------------------
-def test_a_scene_directory_holds_the_image_labels_occupancy_and_every_mask(written):
+def test_a_scene_directory_holds_scene_volume_and_instance_labels(written):
     root, scene = written
     directory = scene_directory(root, scene.scene_id)
-    for name in (IMAGE_FILE, LABELS_FILE, OCCUPANCY_FILE, SCENE_RECORD):
+    for name in (SCENE_VOLUME_FILE, INSTANCE_LABELS_FILE):
         assert (directory / name).is_file()
-    for spec in SHAPE_VOCABULARY:
-        assert (directory / MASK_DIR / mask_filename(spec.id)).is_file()
+    for name in (IMAGE_FILE, LABELS_FILE, OCCUPANCY_FILE, SCENE_RECORD):
+        assert not (directory / name).exists()
+    assert not (directory / MASK_DIR).exists()
     assert scene_path(root, scene.scene_id) == directory
+
+
+def test_a_scene_with_only_the_shared_volume_names_still_loads(written, tmp_path, scene):
+    source = scene_directory(written[0], scene.scene_id)
+    directory = tmp_path / "scenes" / scene.scene_id
+    directory.mkdir(parents=True)
+    for name in (SCENE_VOLUME_FILE, INSTANCE_LABELS_FILE):
+        (directory / name).write_bytes((source / name).read_bytes())
+    volumes = load_scene(directory)
+    assert np.array_equal(volumes.instance_labels, scene.instance_labels)
+    assert volumes.has_image
+    assert np.array_equal(volumes.occupancy.astype(bool), scene.instance_labels != 0)
+    assert scene_path(tmp_path, scene.scene_id) == directory
+
+
+def test_an_older_corpus_gains_the_long_names_by_aliasing(tmp_path, scene):
+    root = tmp_path / "old"
+    save_scene(
+        root,
+        scene.scene_id,
+        instance_labels=scene.instance_labels,
+        occupancy=scene.scene_volume,
+        spacing=scene.spacing,
+        image=scene.appearance.image,
+        inspection_extras=True,
+        record=scene_record(scene, split="train"),
+    )
+    directory = scene_directory(root, scene.scene_id)
+    (directory / SCENE_VOLUME_FILE).unlink()
+    (directory / INSTANCE_LABELS_FILE).unlink()
+    assert (directory / IMAGE_FILE).is_file()
+    ensure_scene_name_aliases(directory)
+    assert (directory / SCENE_VOLUME_FILE).samefile(directory / IMAGE_FILE)
+    assert (directory / INSTANCE_LABELS_FILE).samefile(directory / LABELS_FILE)
+    volumes = load_scene(directory)
+    assert np.array_equal(volumes.instance_labels, scene.instance_labels)
 
 
 def test_a_scene_reads_back_with_its_labels_and_occupancy_intact(written):
@@ -152,17 +194,35 @@ def test_the_image_survives_uint16_storage_well_below_the_noise_level(written):
     assert error < 0.01 * scene.appearance.parameters["noise_sigma"]
 
 
-def test_every_stored_structure_mask_matches_the_label_volume(written):
-    root, scene = written
-    directory = scene_directory(root, scene.scene_id)
+def test_every_stored_structure_mask_matches_the_label_volume(tmp_path, scene):
+    save_scene(
+        tmp_path,
+        scene.scene_id,
+        instance_labels=scene.instance_labels,
+        occupancy=scene.scene_volume,
+        spacing=scene.spacing,
+        image=scene.appearance.image,
+        inspection_extras=True,
+        record=scene_record(scene, split="train"),
+    )
+    directory = scene_directory(tmp_path, scene.scene_id)
     for spec in SHAPE_VOCABULARY:
         mask = load_structure_mask(directory, spec.id)
         assert np.array_equal(mask.astype(bool), scene.instance_labels == spec.id)
 
 
-def test_the_scene_record_is_self_describing(written):
-    root, scene = written
-    record = load_scene_record(scene_directory(root, scene.scene_id))
+def test_the_scene_record_is_self_describing(tmp_path, scene):
+    save_scene(
+        tmp_path,
+        scene.scene_id,
+        instance_labels=scene.instance_labels,
+        occupancy=scene.scene_volume,
+        spacing=scene.spacing,
+        image=scene.appearance.image,
+        inspection_extras=True,
+        record=scene_record(scene, split="train"),
+    )
+    record = load_scene_record(scene_directory(tmp_path, scene.scene_id))
     assert record["scene_id"] == scene.scene_id
     assert record["array_order"] == "(z, y, x)"
     assert record["world_frame"].startswith("RAS")
@@ -172,29 +232,30 @@ def test_the_scene_record_is_self_describing(written):
     assert record["appearance"]["structure_intensities"].keys() == set(SHAPE_VOCABULARY.names)
 
 
-def test_example_masks_are_written_in_clause_order(written, tmp_path):
+def test_example_masks_are_written_in_clause_order(written):
     root, scene = written
     example = scene.examples[0].metadata
     save_example_masks(
         root,
-        scene.scene_id,
         example.example_id,
         instance_labels=scene.instance_labels,
         target_instance_id=example.target_instance_id,
         anchor_instance_ids=example.anchor_instance_ids,
+        anchor_shape_names=example.anchor_shape_names,
         spacing=scene.spacing,
-        record=example.to_json_dict(),
     )
-    directory = scene_directory(root, scene.scene_id) / "examples"
-    target, _ = load_nifti(directory / f"{example.example_id}_target.nii.gz", dtype=np.uint8)
-    anchors, _ = load_nifti(directory / f"{example.example_id}_anchors.nii.gz", dtype=np.uint8)
+    directory = example_directory(root, example.example_id)
+    target, _ = load_nifti(directory / TARGET_MASK_FILE, dtype=np.uint8)
+    union, _ = load_nifti(directory / ANCHOR_UNION_FILE, dtype=np.uint8)
     assert np.array_equal(target.astype(bool), scene.instance_labels == example.target_instance_id)
-    assert anchors.shape[0] == 3
-    for slot, instance_id in enumerate(example.anchor_instance_ids):
-        assert np.array_equal(anchors[slot].astype(bool), scene.instance_labels == instance_id)
-    record = json.loads((directory / f"{example.example_id}.json").read_text(encoding="utf-8"))
-    assert record["prompt"] == example.prompt
-    assert record["anchor_shape_names"] == list(example.anchor_shape_names)
+    stacked = []
+    for slot, (instance_id, shape_name) in enumerate(
+        zip(example.anchor_instance_ids, example.anchor_shape_names)
+    ):
+        mask, _ = load_nifti(directory / anchor_mask_filename(slot, shape_name), dtype=np.uint8)
+        assert np.array_equal(mask.astype(bool), scene.instance_labels == instance_id)
+        stacked.append(mask)
+    assert np.array_equal(union.astype(bool), np.any(np.stack(stacked).astype(bool), axis=0))
 
 
 def test_an_absent_scene_says_which_scene_is_missing(tmp_path):

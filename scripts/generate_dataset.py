@@ -3,17 +3,14 @@
 
 Writes, under ``--output-root``::
 
-    scenes/<scene_id>/image.nii.gz       the simulated MRI-like volume (float32)
-    scenes/<scene_id>/labels.nii.gz      instance labels, 0 and 1..10 (uint8)
-    scenes/<scene_id>/occupancy.nii.gz   binary foreground (uint8)
-    scenes/<scene_id>/masks/*.nii.gz     one binary mask per structure
-    scenes/<scene_id>/examples/*         per-example target, anchor stack, prompt
-    scenes/<scene_id>/scene.json         seeds, placed parameters, appearance draws
-    manifests/<split>.jsonl      one ExampleMetadata per retained example
-    manifests/<split>_candidates.jsonl   all ten candidates (--keep-all-candidates)
-    run_metadata.json            configs, seeds, versions, git revision, hardware,
-                                 exact counts, appearance statistics and the
-                                 rejection log
+    scenes/<scene_id>/scene_volume.nii.gz
+    scenes/<scene_id>/instance_labels.nii.gz
+    examples/<example_id>/target_mask.nii.gz
+    examples/<example_id>/anchor_{slot}_{shape}.nii.gz
+    examples/<example_id>/anchor_union.nii.gz
+    manifests/<split>.jsonl
+    manifests/<split>_candidates.jsonl
+    run_metadata.json
 
 With ``storage.scene_array_format: npz_compressed`` a scene is instead the
 single ``scenes/<scene_id>.npz`` file of the previous milestone.
@@ -54,7 +51,6 @@ from src.data.direction_rules import DIRECTION_RULE_VERSION  # noqa: E402
 from src.data.scene_generator import (  # noqa: E402
     GeneratorSettings,
     generate_scene,
-    scene_record,
 )
 from src.data.scene_io import (  # noqa: E402
     BIAS_FILE,
@@ -252,14 +248,14 @@ def resolve_plan(
 
 def prepare_output(root: Path, overwrite: bool) -> None:
     """Create the output tree, refusing to clobber an existing dataset."""
-    scenes, manifests = root / "scenes", root / "manifests"
-    existing = [path for path in (scenes, manifests) if path.exists() and any(path.iterdir())]
+    scenes, examples, manifests = root / "scenes", root / "examples", root / "manifests"
+    existing = [path for path in (scenes, examples, manifests) if path.exists() and any(path.iterdir())]
     if existing and not overwrite:
         raise SystemExit(
             f"{root} already contains a dataset ({', '.join(str(p) for p in existing)}). "
             "Pass --overwrite to replace it."
         )
-    for path in (scenes, manifests):
+    for path in (scenes, examples, manifests):
         if path.exists() and overwrite:
             shutil.rmtree(path)
         path.mkdir(parents=True, exist_ok=True)
@@ -267,7 +263,7 @@ def prepare_output(root: Path, overwrite: bool) -> None:
 
 def write_scene(
     scene,
-    split: str,
+    _split: str,
     output_root: Path,
     storage: StorageOptions,
     *,
@@ -298,7 +294,6 @@ def write_scene(
         occupancy=scene.scene_volume,
         spacing=scene.spacing,
         image=scene.appearance.image if scene.appearance is not None else None,
-        record=scene_record(scene, split=split),
         extra_volumes=diagnostics,
         image_dtype=storage.image_dtype,
     )
@@ -311,13 +306,12 @@ def write_scene(
             continue
         save_example_masks(
             output_root,
-            scene.scene_id,
             metadata.example_id,
             instance_labels=scene.instance_labels,
             target_instance_id=metadata.target_instance_id,
             anchor_instance_ids=metadata.anchor_instance_ids,
+            anchor_shape_names=metadata.anchor_shape_names,
             spacing=scene.spacing,
-            record=metadata.to_json_dict(),
         )
 
 

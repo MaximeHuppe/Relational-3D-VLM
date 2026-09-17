@@ -1,0 +1,1137 @@
+{
+  "appearance": {
+    "class_conditioned_intensities": false,
+    "drawn": {
+      "bias_inhomogeneity": {
+        "max": 0.2998136776244038,
+        "mean": 0.22708485828647842,
+        "min": 0.1501475211029187
+      },
+      "kspace_fraction": {
+        "max": 0.939993498427855,
+        "mean": 0.88132309694482,
+        "min": 0.8202121306350987
+      },
+      "noise_sigma": {
+        "max": 0.0299794584272305,
+        "mean": 0.02243251804725603,
+        "min": 0.015075740561395367
+      },
+      "parenchyma_intensity": {
+        "max": 0.6985010984709101,
+        "mean": 0.6242886957408293,
+        "min": 0.5500289867518875
+      }
+    },
+    "enabled": true,
+    "measured": {
+      "contrast_to_background_variation": {
+        "max": 2.8448717205652674,
+        "mean": 1.626090841036751,
+        "min": 1.0407639743456722
+      },
+      "contrast_to_noise": {
+        "max": 13.80227696411826,
+        "mean": 7.365633419792893,
+        "min": 4.145080001984312
+      },
+      "mean_contrast": {
+        "max": 0.24237942013827954,
+        "mean": 0.18444262453025015,
+        "min": 0.12657679573833822
+      },
+      "tissue_background_std": {
+        "max": 0.1928539973914941,
+        "mean": 0.11691658732688225,
+        "min": 0.061760839902045596
+      }
+    },
+    "scenes": 500,
+    "structure_polarity": "darker"
+  },
+  "configs": {
+    "appearance": {
+      "acquisition": {
+        "kspace_fraction": [
+          0.82,
+          0.94
+        ],
+        "noise_sigma": [
+          0.015,
+          0.03
+        ]
+      },
+      "appearance_version": "1.0.0",
+      "bias_field": {
+        "correlation_voxels": 40.0,
+        "enabled": true,
+        "inhomogeneity": [
+          0.15,
+          0.3
+        ]
+      },
+      "body": {
+        "center_jitter_voxels": 1.5,
+        "constrain_placement": true,
+        "enabled": true,
+        "exponent": [
+          2.5,
+          3.5
+        ],
+        "rim": {
+          "enabled": true,
+          "thickness_voxels": [
+            1.5,
+            3.0
+          ]
+        },
+        "semi_axis_fraction": [
+          0.45,
+          0.49
+        ],
+        "subdivisions": 2
+      },
+      "enabled": true,
+      "intensities": {
+        "air": 0.0,
+        "class_conditioned": false,
+        "parenchyma": [
+          0.55,
+          0.7
+        ],
+        "rim": [
+          0.8,
+          1.0
+        ],
+        "structure_contrast": 0.15,
+        "structure_contrast_jitter": 0.04,
+        "structure_polarity": "darker"
+      },
+      "normalization": {
+        "clip": [
+          -0.5,
+          1.5
+        ],
+        "mode": "percentile",
+        "percentiles": [
+          0.5,
+          99.5
+        ]
+      },
+      "partial_volume": {
+        "subdivisions": 4
+      },
+      "texture": {
+        "coarse": {
+          "amplitude": 0.055,
+          "correlation_voxels": 14.0
+        },
+        "fine": {
+          "amplitude": 0.022,
+          "correlation_voxels": 3.0
+        },
+        "per_structure_amplitude": 0.02
+      }
+    },
+    "generator": {
+      "anchors": {
+        "anchor_order": "ascending_distance",
+        "num_anchors": 3,
+        "on_no_feasible_triplet": "regenerate_scene",
+        "ranking": "euclidean_centroid_distance",
+        "ranking_tie_break": "instance_id",
+        "require_distinct_directions": true,
+        "store_anchor_union_mask": true
+      },
+      "direction_rule_version": "1.0.0",
+      "examples": {
+        "examples_per_scene": 10
+      },
+      "generator_version": "1.0.0",
+      "geometry": {
+        "background_value": 0,
+        "coordinate_frame": "RAS",
+        "foreground_value": 1,
+        "in_bounds_margin_voxels": 2,
+        "spacing": [
+          1.0,
+          1.0,
+          1.0
+        ],
+        "volume_shape": [
+          64,
+          64,
+          64
+        ]
+      },
+      "packing": {
+        "allow_overlap": false,
+        "escalation_volume_shapes": [
+          [
+            72,
+            72,
+            72
+          ],
+          [
+            80,
+            80,
+            80
+          ]
+        ],
+        "max_object_attempts": 200,
+        "max_scene_attempts": 50,
+        "min_separation_voxels": 0,
+        "rescale_size_ranges_on_escalation": true,
+        "shapes_per_scene": 10
+      },
+      "schema_version": "1.0.0",
+      "seeds": {
+        "master_seed": 20260915,
+        "seed_namespace": "relational3d-vlm/v1"
+      },
+      "smoke": {
+        "keep_all_candidates": true,
+        "output_root": "data/smoke",
+        "scene_seed_ranges": {
+          "test": [
+            9200000,
+            9200004
+          ],
+          "train": [
+            9000000,
+            9000016
+          ],
+          "val": [
+            9100000,
+            9100004
+          ]
+        },
+        "scenes": {
+          "test": 4,
+          "train": 16,
+          "val": 4
+        }
+      },
+      "storage": {
+        "example_manifest_format": "jsonl",
+        "image_dtype": "uint16",
+        "root": "data/dataset_mri",
+        "scene_array_format": "nifti",
+        "write_appearance_diagnostics": false,
+        "write_example_masks": true
+      },
+      "validation": {
+        "log_acceptance_rate": true,
+        "log_rejection_reasons": true,
+        "reject_anchor_order_mismatch": true,
+        "reject_channel_anchor_mismatch": true,
+        "reject_empty_object": true,
+        "reject_out_of_bounds": true,
+        "reject_overlap": true,
+        "reject_target_in_anchor_channel": true,
+        "require_exactly_ten_instances": true,
+        "require_prompt_round_trip": true
+      },
+      "vocabulary_version": "1.0.0"
+    },
+    "model": {
+      "baselines": [
+        {
+          "anchor_representation": "ordered_channels",
+          "name": "anchor_masks_only",
+          "use_prompt": false
+        },
+        {
+          "name": "prompt_only",
+          "use_anchor_masks": false,
+          "use_coordinates": true
+        },
+        {
+          "anchor_representation": "union_mask",
+          "name": "prompt_plus_union_mask"
+        },
+        {
+          "anchor_representation": "ordered_channels",
+          "name": "full",
+          "use_prompt": true
+        }
+      ],
+      "model_version": "1.1.0",
+      "smoke": {
+        "stage_a": {
+          "decoder_channels": [
+            32,
+            16,
+            8
+          ],
+          "encoder_channels": [
+            8,
+            16,
+            32,
+            64
+          ],
+          "prompt_decoder": {
+            "head_dim": 32,
+            "heads": 2
+          },
+          "prompt_encoder": {
+            "embed_dim": 64,
+            "text_dim": 64
+          },
+          "stem_channels": 8
+        },
+        "stage_b": {
+          "decoder_channels": [
+            32,
+            16,
+            8
+          ],
+          "encoder_channels": [
+            8,
+            16,
+            32,
+            64
+          ],
+          "fusion": {
+            "intersection": {
+              "hidden_channels": 64
+            },
+            "num_heads": 2
+          },
+          "prompt_encoder": {
+            "embedding_dim": 64
+          },
+          "structure_encoder": {
+            "token_dim": 64
+          }
+        }
+      },
+      "stage_a": {
+        "activation": "relu",
+        "align_corners": true,
+        "bottleneck_resolution": 8,
+        "decoder_channels": [
+          128,
+          64,
+          32
+        ],
+        "deep_supervision": {
+          "inference_output": "full_resolution",
+          "resolutions": [
+            16,
+            32,
+            64
+          ],
+          "target_downsampling": "max_pool",
+          "weights": [
+            0.1,
+            0.3,
+            0.6
+          ]
+        },
+        "encoder_channels": [
+          32,
+          64,
+          128,
+          256
+        ],
+        "eval_metrics": [
+          "dice",
+          "iou"
+        ],
+        "fusion": {
+          "bias_init": "prior",
+          "per_query_bias": true,
+          "prior_foreground_fraction": 0.0016,
+          "type": "scaled_dot_product_mask_head"
+        },
+        "in_channels": 1,
+        "kernel_size": 3,
+        "name": "voxdense_shape_segmenter",
+        "norm": "instance",
+        "num_prompts": 10,
+        "prompt_decoder": {
+          "head_dim": 64,
+          "heads": 4,
+          "positional_encoding": "decomposed_3d",
+          "positional_encoding_on": "keys",
+          "residual_norm": "layer_norm"
+        },
+        "prompt_encoder": {
+          "embed_dim": 256,
+          "num_shapes": 10,
+          "text_dim": 256,
+          "type": "closed_vocabulary_shape_names"
+        },
+        "resblocks": [
+          1,
+          1,
+          1
+        ],
+        "resolutions": [
+          64,
+          32,
+          16,
+          8
+        ],
+        "stem_channels": 32,
+        "strides": [
+          2,
+          2,
+          2
+        ],
+        "upsample": "trilinear"
+      },
+      "stage_b": {
+        "activation": "leaky_relu",
+        "bottleneck_resolution": 8,
+        "decoder_channels": [
+          128,
+          64,
+          32
+        ],
+        "encoder_channels": [
+          32,
+          64,
+          128,
+          256
+        ],
+        "fusion": {
+          "attention_resolution": 8,
+          "branch_fusion": "cross_attention",
+          "decoder_conditioning": {
+            "at_resolutions": [
+              16,
+              32
+            ],
+            "type": "film"
+          },
+          "forbid_full_resolution_attention": true,
+          "intersection": {
+            "hidden_channels": 256,
+            "inputs": [
+              "H1",
+              "H2",
+              "H3",
+              "H1_mul_H2_mul_H3"
+            ],
+            "module": "pointwise_fusion_block"
+          },
+          "num_heads": 4
+        },
+        "in_channels": 3,
+        "name": "relational_vlm",
+        "norm": "instance",
+        "occupancy": {
+          "enabled": true,
+          "inject_at_resolutions": [
+            16,
+            32,
+            64
+          ],
+          "mask_anchors": true
+        },
+        "out_channels": 1,
+        "output": {
+          "bias_init": "prior",
+          "binary_threshold": 0.5,
+          "prior_foreground_fraction": 0.0016,
+          "return_binary_mask": true,
+          "return_logits": true,
+          "return_probabilities": true
+        },
+        "position_features": {
+          "inject_at_resolutions": [
+            64,
+            32,
+            16,
+            8
+          ],
+          "type": "normalized_world_xyz"
+        },
+        "prompt_encoder": {
+          "embedding_dim": 256,
+          "num_directions": 6,
+          "num_shapes": 10,
+          "num_slots": 3,
+          "pair_embedding": true,
+          "pool_clauses": false,
+          "type": "closed_vocabulary"
+        },
+        "resolutions": [
+          64,
+          32,
+          16,
+          8
+        ],
+        "structure_encoder": {
+          "per_anchor_features": [
+            "masked_pooled_encoder_features",
+            "normalized_world_centroid",
+            "normalized_bbox_extent",
+            "normalized_voxel_volume"
+          ],
+          "shape_embedding": true,
+          "slot_embedding": true,
+          "token_dim": 256
+        }
+      }
+    },
+    "shapes": {
+      "axis_extent_fraction_range": [
+        0.08,
+        0.22
+      ],
+      "background_label": 0,
+      "direction_axis": {
+        "anterior": "y",
+        "inferior": "z",
+        "lateral": "x",
+        "medial": "x",
+        "posterior": "y",
+        "superior": "z"
+      },
+      "direction_opposites": {
+        "anterior": "posterior",
+        "inferior": "superior",
+        "lateral": "medial",
+        "medial": "lateral",
+        "posterior": "anterior",
+        "superior": "inferior"
+      },
+      "directions": [
+        "anterior",
+        "posterior",
+        "superior",
+        "inferior",
+        "medial",
+        "lateral"
+      ],
+      "num_classes": 10,
+      "reference_axis_length": 64,
+      "shapes": [
+        {
+          "family": "box",
+          "id": 1,
+          "mean_volume_voxels": 512,
+          "name": "cube",
+          "params": {
+            "side": [
+              6.0,
+              10.0
+            ]
+          }
+        },
+        {
+          "family": "box",
+          "id": 2,
+          "mean_volume_voxels": 531,
+          "min_anisotropy_ratio": 1.35,
+          "name": "cuboid",
+          "params": {
+            "size_x": [
+              5.2,
+              11.0
+            ],
+            "size_y": [
+              5.2,
+              11.0
+            ],
+            "size_z": [
+              5.2,
+              11.0
+            ]
+          }
+        },
+        {
+          "family": "ellipsoidal",
+          "id": 3,
+          "mean_volume_voxels": 523,
+          "name": "sphere",
+          "params": {
+            "radius": [
+              4.0,
+              6.0
+            ]
+          }
+        },
+        {
+          "family": "ellipsoidal",
+          "id": 4,
+          "mean_volume_voxels": 523,
+          "min_anisotropy_ratio": 1.35,
+          "name": "ellipsoid",
+          "params": {
+            "radius_x": [
+              3.5,
+              6.5
+            ],
+            "radius_y": [
+              3.5,
+              6.5
+            ],
+            "radius_z": [
+              3.5,
+              6.5
+            ]
+          }
+        },
+        {
+          "axis": "z",
+          "family": "swept",
+          "id": 5,
+          "mean_volume_voxels": 502,
+          "name": "cylinder",
+          "params": {
+            "height": [
+              7.0,
+              13.0
+            ],
+            "radius": [
+              3.0,
+              5.0
+            ]
+          }
+        },
+        {
+          "axis": "z",
+          "family": "swept",
+          "id": 6,
+          "mean_volume_voxels": 380,
+          "name": "cone",
+          "params": {
+            "height": [
+              10.0,
+              14.0
+            ],
+            "radius": [
+              4.5,
+              6.5
+            ]
+          }
+        },
+        {
+          "axis": "z",
+          "family": "box",
+          "id": 7,
+          "mean_volume_voxels": 400,
+          "name": "pyramid",
+          "params": {
+            "base_side": [
+              8.0,
+              12.0
+            ],
+            "height": [
+              10.0,
+              14.0
+            ]
+          }
+        },
+        {
+          "axis": "y",
+          "family": "box",
+          "id": 8,
+          "mean_volume_voxels": 450,
+          "name": "triangular_prism",
+          "params": {
+            "base_width": [
+              8.0,
+              12.0
+            ],
+            "depth": [
+              7.0,
+              11.0
+            ],
+            "height": [
+              8.0,
+              12.0
+            ]
+          }
+        },
+        {
+          "axis": "z",
+          "family": "toroidal",
+          "id": 9,
+          "mean_volume_voxels": 374,
+          "name": "torus",
+          "params": {
+            "major_radius": [
+              3.0,
+              4.5
+            ],
+            "minor_radius": [
+              2.0,
+              2.5
+            ]
+          },
+          "thin_axis_exception": "z"
+        },
+        {
+          "axis": "z",
+          "family": "swept",
+          "id": 10,
+          "mean_volume_voxels": 469,
+          "name": "capsule",
+          "params": {
+            "radius": [
+              3.5,
+              4.5
+            ],
+            "segment_length": [
+              3.0,
+              5.0
+            ]
+          }
+        }
+      ],
+      "vocabulary_version": "1.0.0"
+    },
+    "split": {
+      "anchor_classes": {
+        "test": "all",
+        "train": "all",
+        "val": "all"
+      },
+      "expected_examples": {
+        "test": 50,
+        "train": 2800,
+        "val": 100
+      },
+      "scene_seed_ranges": {
+        "test": [
+          3000000,
+          3000050
+        ],
+        "train": [
+          1000000,
+          1000400
+        ],
+        "val": [
+          2000000,
+          2000050
+        ]
+      },
+      "scenes": {
+        "test": 50,
+        "total": 500,
+        "train": 400,
+        "val": 50
+      },
+      "secondary_protocols": {
+        "held_out_packing_patterns": {
+          "description": "Layouts with spatial packing patterns never seen in training.",
+          "enabled": false
+        },
+        "held_out_size_ranges": {
+          "description": "Target objects drawn from size ranges never seen in training.",
+          "enabled": false
+        }
+      },
+      "split_version": "1.0.0",
+      "target_classes": {
+        "test": [
+          "triangular_prism"
+        ],
+        "train": [
+          "cube",
+          "sphere",
+          "cylinder",
+          "cone",
+          "pyramid",
+          "torus",
+          "capsule"
+        ],
+        "val": [
+          "cuboid",
+          "ellipsoid"
+        ]
+      }
+    },
+    "train": {
+      "augmentations": {
+        "arbitrary_rotation": {
+          "allowed_in_milestone": false,
+          "enabled": false
+        },
+        "axis_permutation": {
+          "enabled": false,
+          "rewrite_tested": false
+        },
+        "crop": {
+          "enabled": false,
+          "rewrite_tested": false
+        },
+        "enabled": true,
+        "flip_x": {
+          "enabled": false,
+          "rewrite_tested": false
+        },
+        "flip_y": {
+          "enabled": false,
+          "rewrite_tested": false
+        },
+        "flip_z": {
+          "enabled": false,
+          "rewrite_tested": false
+        },
+        "rotation_90": {
+          "angles": [
+            0,
+            90,
+            180,
+            -90
+          ],
+          "apply_to": {
+            "stage_a": false,
+            "stage_b": true
+          },
+          "axes": [
+            "x",
+            "y",
+            "z"
+          ],
+          "enabled": true,
+          "max_attempts": 8,
+          "rewrite_tested": true
+        },
+        "translate": {
+          "enabled": false,
+          "rewrite_tested": false
+        }
+      },
+      "common": {
+        "checkpoint_metric": "dice",
+        "checkpoint_mode": "max",
+        "deterministic": true,
+        "early_stopping": {
+          "min_delta": 0.005,
+          "patience": 5
+        },
+        "log_every_steps": 20,
+        "save_metadata": [
+          "config",
+          "seeds",
+          "generator_version",
+          "direction_rule_version",
+          "vocabulary_version",
+          "schema_version",
+          "git_revision",
+          "hardware",
+          "checkpoint_metadata"
+        ],
+        "seed": 20260915
+      },
+      "evaluation": {
+        "counterfactuals": [
+          "permute_anchor_channels_fixed_prompt",
+          "permute_prompt_clauses_fixed_channels",
+          "replace_direction_with_opposite",
+          "replace_one_anchor_shape_name",
+          "remove_one_anchor",
+          "reorder_channels_and_prompt_together"
+        ],
+        "metrics": [
+          "dice",
+          "iou",
+          "hausdorff"
+        ],
+        "qualitative": {
+          "num_scenes": 8,
+          "save_predictions": true
+        },
+        "stratify_by": [
+          "target_shape",
+          "anchor_shape",
+          "direction",
+          "successful_generation_count",
+          "anchor_source"
+        ]
+      },
+      "hardware_profiles": {
+        "laptop_mps": {
+          "batch_size": 4,
+          "device": "mps",
+          "gradient_accumulation_steps": 4,
+          "model_profile": "default",
+          "num_workers": 2,
+          "precision": "bf16"
+        },
+        "rtx5090": {
+          "batch_size": 16,
+          "device": "cuda",
+          "gradient_accumulation_steps": 1,
+          "model_profile": "default",
+          "num_workers": 8,
+          "precision": "bf16"
+        }
+      },
+      "logging": {
+        "backend": "wandb",
+        "wandb": {
+          "project": "relational-3d-vlm",
+          "tags": [
+            "relational-3d-vlm",
+            "augmentation",
+            "occupancy-volume",
+            "dataset-mri",
+            "epoch50"
+          ]
+        }
+      },
+      "stage_a": {
+        "epochs": 50,
+        "gate": "all ten classes must reach a documented per-class Dice floor before predicted anchors are used",
+        "loss": {
+          "lambda_bce": 1.0,
+          "lambda_dice": 1.0
+        },
+        "optimizer": {
+          "lr": 0.001,
+          "name": "adamw",
+          "weight_decay": 1e-05
+        },
+        "scheduler": {
+          "name": "cosine",
+          "warmup_epochs": 2
+        },
+        "selection_metric": "val_mean_dice",
+        "smoke": {
+          "early_stopping": {
+            "patience": 0
+          },
+          "epochs": 40,
+          "hardware": {
+            "batch_size": 2,
+            "gradient_accumulation_steps": 1,
+            "model_profile": "smoke"
+          },
+          "optimizer": {
+            "lr": 0.002,
+            "name": "adamw",
+            "weight_decay": 0.0
+          },
+          "scheduler": {
+            "name": "cosine",
+            "warmup_epochs": 1
+          }
+        },
+        "threshold": 0.5
+      },
+      "stage_b_oracle": {
+        "anchor_source": "oracle",
+        "epochs": 30,
+        "loss": {
+          "lambda_bce": 1.0,
+          "lambda_dice": 1.0
+        },
+        "optimizer": {
+          "lr": 0.0003,
+          "name": "adamw",
+          "weight_decay": 1e-05
+        },
+        "scheduler": {
+          "name": "cosine",
+          "warmup_epochs": 5
+        },
+        "selection_metric": "val_dice",
+        "smoke": {
+          "early_stopping": {
+            "patience": 0
+          },
+          "epochs": 6,
+          "hardware": {
+            "batch_size": 2,
+            "gradient_accumulation_steps": 1,
+            "model_profile": "smoke"
+          },
+          "optimizer": {
+            "lr": 0.001,
+            "name": "adamw",
+            "weight_decay": 0.0
+          },
+          "scheduler": {
+            "name": "cosine",
+            "warmup_epochs": 1
+          }
+        },
+        "threshold": 0.5
+      },
+      "stage_b_overfit": {
+        "anchor_source": "oracle",
+        "loss": {
+          "lambda_bce": 1.0,
+          "lambda_dice": 1.0
+        },
+        "optimizer": {
+          "lr": 0.001,
+          "name": "adamw",
+          "weight_decay": 0.0
+        },
+        "scenes": 1,
+        "scheduler": {
+          "name": "constant",
+          "warmup_epochs": 0
+        },
+        "smoke": {
+          "early_stopping": {
+            "patience": 0
+          },
+          "hardware": {
+            "batch_size": 2,
+            "gradient_accumulation_steps": 1,
+            "model_profile": "smoke"
+          },
+          "steps": 150
+        },
+        "steps": 2000,
+        "target_train_dice": 0.95,
+        "threshold": 0.5
+      },
+      "stage_b_predicted": {
+        "anchor_source": "stage_a_prediction",
+        "report_delta_vs_oracle": true,
+        "stage_a_checkpoint": "runs/stage_a/best.pt",
+        "threshold": 0.5
+      },
+      "train_version": "1.2.0"
+    }
+  },
+  "created_at": "2026-09-17T18:46:03+0200",
+  "elapsed_seconds": 212.55,
+  "environment": {
+    "git_revision": "f4ed0523f528d1a478010dec6adfe62ebcff7683",
+    "machine": "x86_64",
+    "numpy": "2.5.3",
+    "platform": "Linux-6.17.0-35-generic-x86_64-with-glibc2.39",
+    "python": "3.12.3"
+  },
+  "geometry": {
+    "escalation_volume_shapes": [
+      [
+        72,
+        72,
+        72
+      ],
+      [
+        80,
+        80,
+        80
+      ]
+    ],
+    "in_bounds_margin_voxels": 2,
+    "spacing": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "volume_shape": [
+      64,
+      64,
+      64
+    ]
+  },
+  "kept_all_candidates": false,
+  "output_root": "/home/imag2/Documents/IMAG2/Relational-3D-VLM-new-dataset/data/dataset_mri",
+  "rejection_log": {
+    "object_rejections": {
+      "outside_body": 10775,
+      "overlap": 3316
+    },
+    "scene_acceptance_rate": 0.32658393207054215,
+    "scene_attempts": 1531,
+    "scene_rejections": {
+      "ambiguous_direction": 19,
+      "no_feasible_anchor_triple": 1012
+    },
+    "scenes_accepted": 500
+  },
+  "smoke": false,
+  "splits": {
+    "test": {
+      "candidate_examples": 500,
+      "escalated_scenes": 0,
+      "mean_scene_attempts": 2.98,
+      "name": "test",
+      "per_target_counts": {
+        "triangular_prism": 50
+      },
+      "retained_examples": 50,
+      "scenes": 50,
+      "seed_range": [
+        3000000,
+        3000050
+      ],
+      "target_classes": [
+        "triangular_prism"
+      ]
+    },
+    "train": {
+      "candidate_examples": 4000,
+      "escalated_scenes": 0,
+      "mean_scene_attempts": 3.155,
+      "name": "train",
+      "per_target_counts": {
+        "capsule": 400,
+        "cone": 400,
+        "cube": 400,
+        "cylinder": 400,
+        "pyramid": 400,
+        "sphere": 400,
+        "torus": 400
+      },
+      "retained_examples": 2800,
+      "scenes": 400,
+      "seed_range": [
+        1000000,
+        1000400
+      ],
+      "target_classes": [
+        "cube",
+        "sphere",
+        "cylinder",
+        "cone",
+        "pyramid",
+        "torus",
+        "capsule"
+      ]
+    },
+    "val": {
+      "candidate_examples": 500,
+      "escalated_scenes": 0,
+      "mean_scene_attempts": 2.4,
+      "name": "val",
+      "per_target_counts": {
+        "cuboid": 50,
+        "ellipsoid": 50
+      },
+      "retained_examples": 100,
+      "scenes": 50,
+      "seed_range": [
+        2000000,
+        2000050
+      ],
+      "target_classes": [
+        "cuboid",
+        "ellipsoid"
+      ]
+    }
+  },
+  "storage": {
+    "image_dtype": "uint16",
+    "scene_array_format": "nifti",
+    "write_appearance_diagnostics": false,
+    "write_example_masks": true
+  },
+  "totals": {
+    "candidate_examples": 5000,
+    "retained_examples": 2950,
+    "scenes": 500
+  },
+  "versions": {
+    "appearance_version": "1.0.0",
+    "direction_rule_version": "1.0.0",
+    "generator_version": "1.0.0",
+    "schema_version": "1.0.0",
+    "vocabulary_version": "1.0.0"
+  }
+}
