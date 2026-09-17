@@ -132,6 +132,19 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="override the model width profile",
     )
     parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument(
+        "--early-stopping-patience", type=int, default=None, dest="early_stopping_patience",
+        help="epochs without a Dice rise larger than --early-stopping-min-delta "
+             "before halt; 0 = run the full budget",
+    )
+    parser.add_argument(
+        "--early-stopping-min-delta", type=float, default=None, dest="early_stopping_min_delta",
+        help="minimum validation Dice improvement that resets early-stopping patience",
+    )
+    parser.add_argument(
+        "--wandb-project", default=None,
+        help="Weights & Biases project (default: logging.wandb.project in configs/train.yaml)",
+    )
     parser.add_argument("--steps", type=int, default=None, help="Phase 2 step budget")
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--learning-rate", type=float, default=None)
@@ -208,6 +221,8 @@ def build_settings(args: argparse.Namespace) -> TrainingSettings:
             "seed": args.seed,
             "model_profile": args.model_profile,
             "anchor_source": args.anchor_source,
+            "early_stopping_patience": args.early_stopping_patience,
+            "early_stopping_min_delta": args.early_stopping_min_delta,
         },
     )
 
@@ -229,7 +244,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             "occupancy-decoder",
             "smoke" if args.smoke else "",
             args.variant or "",
-        ]
+        ],
+        project=args.wandb_project,
     )
     run_name = output_dir.name
     full_config = load_all_configs()

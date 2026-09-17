@@ -174,6 +174,13 @@ def test_logging_config_appends_tags_from_train_yaml():
     assert "relational-3d-vlm" in cfg["wandb"]["tags"]
 
 
+def test_logging_config_can_override_the_wandb_project():
+    cfg = logging_config(project="relational-3d-vlm-realistic")
+    assert cfg["wandb"]["project"] == "relational-3d-vlm-realistic"
+    default = logging_config()
+    assert default["wandb"]["project"] == "relational-3d-vlm"
+
+
 def test_the_epoch_row_shows_anchor_quality_for_both_splits():
     """The gap between the two is the signal, so neither may be dropped."""
     row = _format_anchor_quality(

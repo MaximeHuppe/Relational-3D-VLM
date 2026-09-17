@@ -9,11 +9,11 @@ The five hexagons in ``docs/EXPERIMENTS.md`` / ``docs/experiments/experiment_flo
     EX-4  Stage B, predicted+augA+augB  pred_dataset_realistic_augA_augB  ← EX-3
     EX-5  Stage B, oracle, no aug  oracle_dataset_realistic
 
-Every flag that distinguishes an arm is on the command line. Epochs, learning
-rate, seed, early stopping and the rest come from ``configs/train.yaml`` at the
-git revision recorded in each run's ``best.json``. Re-running the same command
-at the same commit, against the same corpus (``data/processed/run_metadata.json``),
-is the reproduction recipe.
+Every flag that distinguishes an arm is on the command line, including the W&B
+project, epoch budget and early-stopping rule. Learning rate, seed and the rest
+come from ``configs/train.yaml`` at the git revision recorded in each run's
+``best.json``. Re-running the same command at the same commit, against the same
+corpus (``data/processed/run_metadata.json``), is the reproduction recipe.
 
 Examples::
 
@@ -44,6 +44,11 @@ from src.provenance import git_is_dirty, git_revision  # noqa: E402
 
 DEFAULT_DATA_ROOT = Path("data/processed")
 DEFAULT_PROFILE = "rtx5090"
+DEFAULT_WANDB_PROJECT = "relational-3d-vlm-realistic"
+STAGE_A_EPOCHS = 50
+STAGE_B_EPOCHS = 30
+EARLY_STOPPING_PATIENCE = 0
+EARLY_STOPPING_MIN_DELTA = 0.005
 CAMPAIGN_DIR = Path("runs/experiments/realistic-appearance")
 CAMPAIGN_FILENAME = "campaign.json"
 
@@ -59,6 +64,10 @@ class Experiment:
     model: str                      # "shape" or "relational"
     output: Path                    # relative to the project root
     augment: bool
+    epochs: int
+    wandb_project: str = DEFAULT_WANDB_PROJECT
+    early_stopping_patience: int = EARLY_STOPPING_PATIENCE
+    early_stopping_min_delta: float = EARLY_STOPPING_MIN_DELTA
     anchors: str | None = None      # None for Stage A; "oracle" / "predicted" for Stage B
     stage_a_id: str | None = None   # predicted Stage B: which Stage A experiment supplies anchors
     depends_on: tuple[str, ...] = ()
@@ -76,6 +85,7 @@ REALISTIC_EXPERIMENTS: tuple[Experiment, ...] = (
         model="shape",
         output=Path("runs/shape_segmenter/dataset_realistic"),
         augment=False,
+        epochs=STAGE_A_EPOCHS,
     ),
     Experiment(
         id="EX-2",
@@ -83,6 +93,7 @@ REALISTIC_EXPERIMENTS: tuple[Experiment, ...] = (
         model="relational",
         output=Path("runs/relational_model/predicted/pred_dataset_realistic_augB"),
         augment=True,
+        epochs=STAGE_B_EPOCHS,
         anchors="predicted",
         stage_a_id="EX-1",
         depends_on=("EX-1",),
@@ -93,6 +104,7 @@ REALISTIC_EXPERIMENTS: tuple[Experiment, ...] = (
         model="shape",
         output=Path("runs/shape_segmenter/dataset_realistic_aug"),
         augment=True,
+        epochs=STAGE_A_EPOCHS,
     ),
     Experiment(
         id="EX-4",
@@ -100,6 +112,7 @@ REALISTIC_EXPERIMENTS: tuple[Experiment, ...] = (
         model="relational",
         output=Path("runs/relational_model/predicted/pred_dataset_realistic_augA_augB"),
         augment=True,
+        epochs=STAGE_B_EPOCHS,
         anchors="predicted",
         stage_a_id="EX-3",
         depends_on=("EX-3",),
@@ -110,6 +123,7 @@ REALISTIC_EXPERIMENTS: tuple[Experiment, ...] = (
         model="relational",
         output=Path("runs/relational_model/oracle/oracle_dataset_realistic"),
         augment=False,
+        epochs=STAGE_B_EPOCHS,
         anchors="oracle",
     ),
 )
@@ -132,6 +146,16 @@ def _augment_flag(enabled: bool) -> str:
     return "--augment" if enabled else "--no-augment"
 
 
+def _schedule_flags(experiment: Experiment) -> list[str]:
+    """Epochs, early stopping and W&B project — the columns that must be on the CLI."""
+    return [
+        "--epochs", str(experiment.epochs),
+        "--early-stopping-patience", str(experiment.early_stopping_patience),
+        "--early-stopping-min-delta", str(experiment.early_stopping_min_delta),
+        "--wandb-project", experiment.wandb_project,
+    ]
+
+
 def stage_a_checkpoint(experiment: Experiment) -> Path:
     """Path of the Stage A ``best.pt`` a predicted Stage B run consumes."""
     if experiment.stage_a_id is None:
@@ -149,6 +173,7 @@ def training_argv(experiment: Experiment, ctx: RunContext) -> list[str]:
             "--data-root", data_root,
             "--output", output,
             "--profile", ctx.profile,
+            *_schedule_flags(experiment),
             _augment_flag(experiment.augment),
         ]
     argv = [
@@ -163,6 +188,7 @@ def training_argv(experiment: Experiment, ctx: RunContext) -> list[str]:
             "--data-root", data_root,
             "--output", output,
             "--profile", ctx.profile,
+            *_schedule_flags(experiment),
             _augment_flag(experiment.augment),
         ]
     )

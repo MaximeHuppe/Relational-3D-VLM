@@ -15,6 +15,7 @@ from scripts.run_realistic_experiments import (
     RunContext,
     documented_evaluate_command,
     documented_training_command,
+    evaluate_argv,
     format_command,
     main,
     selected_experiments,
@@ -43,10 +44,17 @@ def test_stage_a_flags_are_explicit_and_do_not_rely_on_config_defaults():
     --data-root data/processed \\
     --output runs/shape_segmenter/dataset_realistic \\
     --profile rtx5090 \\
+    --epochs 50 \\
+    --early-stopping-patience 0 \\
+    --early-stopping-min-delta 0.005 \\
+    --wandb-project relational-3d-vlm-realistic \\
     --no-augment"""
     command_aug = documented_training_command(EXPERIMENTS_BY_ID["EX-3"])
     assert "--augment" in command_aug
     assert "--no-augment" not in command_aug
+    assert EXPERIMENTS_BY_ID["EX-1"].epochs == 50
+    assert EXPERIMENTS_BY_ID["EX-1"].early_stopping_patience == 0
+    assert EXPERIMENTS_BY_ID["EX-1"].wandb_project == "relational-3d-vlm-realistic"
 
 
 def test_predicted_stage_b_names_the_stage_a_checkpoint_and_turns_aug_on():
@@ -59,6 +67,10 @@ def test_predicted_stage_b_names_the_stage_a_checkpoint_and_turns_aug_on():
     --data-root data/processed \\
     --output runs/relational_model/predicted/pred_dataset_realistic_augB \\
     --profile rtx5090 \\
+    --epochs 30 \\
+    --early-stopping-patience 0 \\
+    --early-stopping-min-delta 0.005 \\
+    --wandb-project relational-3d-vlm-realistic \\
     --augment"""
 
 
@@ -72,6 +84,10 @@ def test_augA_predicted_stage_b_points_at_the_augmented_stage_a():
     --data-root data/processed \\
     --output runs/relational_model/predicted/pred_dataset_realistic_augA_augB \\
     --profile rtx5090 \\
+    --epochs 30 \\
+    --early-stopping-patience 0 \\
+    --early-stopping-min-delta 0.005 \\
+    --wandb-project relational-3d-vlm-realistic \\
     --augment"""
 
 
@@ -84,6 +100,10 @@ def test_oracle_stage_b_has_no_stage_a_and_turns_aug_off():
     --data-root data/processed \\
     --output runs/relational_model/oracle/oracle_dataset_realistic \\
     --profile rtx5090 \\
+    --epochs 30 \\
+    --early-stopping-patience 0 \\
+    --early-stopping-min-delta 0.005 \\
+    --wandb-project relational-3d-vlm-realistic \\
     --no-augment"""
     assert "--stage-a-checkpoint" not in command
 
@@ -101,6 +121,17 @@ def test_test_set_evaluation_is_a_second_command_on_stage_b_only():
     oracle = documented_evaluate_command(EXPERIMENTS_BY_ID["EX-5"])
     assert "--anchor-source oracle" in oracle
     assert "--stage-a-checkpoint" not in oracle
+
+
+def test_schedule_flags_are_on_every_training_command():
+    ctx = RunContext(python=PYTHON_DOC, data_root=DEFAULT_DATA_ROOT, profile=DEFAULT_PROFILE)
+    for experiment in REALISTIC_EXPERIMENTS:
+        argv = training_argv(experiment, ctx)
+        assert argv[argv.index("--epochs") + 1] == str(experiment.epochs)
+        assert argv[argv.index("--early-stopping-patience") + 1] == str(experiment.early_stopping_patience)
+        assert argv[argv.index("--early-stopping-min-delta") + 1] == str(experiment.early_stopping_min_delta)
+        assert argv[argv.index("--wandb-project") + 1] == experiment.wandb_project
+        assert "--wandb-project" not in (evaluate_argv(experiment, ctx) or [])
 
 
 def test_profile_override_lands_on_every_training_command():

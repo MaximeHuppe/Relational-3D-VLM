@@ -88,8 +88,13 @@ def logging_config(
     *,
     extra_tags: Sequence[str] = (),
     config: Mapping[str, Any] | None = None,
+    project: str | None = None,
 ) -> dict[str, Any]:
-    """``configs/train.yaml`` logging block, with optional extra W&B tags."""
+    """``configs/train.yaml`` logging block, with optional extra W&B tags.
+
+    ``project`` overrides ``logging.wandb.project`` so a campaign can sit in
+    its own W&B project without editing the YAML.
+    """
     train = dict(config if config is not None else load_config("train"))
     log_cfg = dict(train.get("logging") or {})
     wandb_cfg = dict(log_cfg.get("wandb") or {})
@@ -98,6 +103,8 @@ def logging_config(
         if tag and tag not in tags:
             tags.append(str(tag))
     wandb_cfg["tags"] = tags
+    if project:
+        wandb_cfg["project"] = project
     log_cfg["wandb"] = wandb_cfg
     return log_cfg
 
