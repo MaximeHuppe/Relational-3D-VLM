@@ -28,6 +28,7 @@ from typing import Any, Iterator, Mapping, Sequence
 import numpy as np
 
 from src.config import load_config
+from src.data.appearance import AppearanceSettings, render_appearance
 from src.data.direction_rules import (
     AmbiguousDirectionError,
     bbox_extent_world,
@@ -81,6 +82,7 @@ class GeneratorSettings:
     shapes_per_scene: int
     reference_axis_length: int
     generator_version: str
+    appearance: AppearanceSettings
 
     @classmethod
     def from_config(cls, config: Mapping[str, Any] | None = None) -> "GeneratorSettings":
@@ -102,6 +104,7 @@ class GeneratorSettings:
             shapes_per_scene=int(packing["shapes_per_scene"]),
             reference_axis_length=int(SHAPE_VOCABULARY.reference_axis_length),
             generator_version=str(config["generator_version"]),
+            appearance=AppearanceSettings.from_config(config.get("appearance")),
         )
 
     def replace_volume_shape(self, volume_shape: Sequence[int]) -> "GeneratorSettings":
@@ -117,6 +120,7 @@ class GeneratorSettings:
             shapes_per_scene=self.shapes_per_scene,
             reference_axis_length=self.reference_axis_length,
             generator_version=self.generator_version,
+            appearance=self.appearance,
         )
 
     @property
@@ -263,6 +267,7 @@ def build_examples(
     instance_labels: np.ndarray,
     settings: GeneratorSettings,
     *,
+    scene_volume: np.ndarray | None = None,
     split: str | None = None,
 ) -> list[Example]:
     """Build the ten candidate examples of an accepted scene.
@@ -271,7 +276,10 @@ def build_examples(
         AmbiguousDirectionError: some pair has no well-defined direction.
         AnchorSelectionError: some target has no feasible three-direction set.
     """
-    scene_volume = (instance_labels != 0).astype(np.uint8)
+    if scene_volume is None:
+        scene_volume = (instance_labels != 0).astype(np.float32)
+    else:
+        scene_volume = np.asarray(scene_volume, dtype=np.float32)
     instance_ids = tuple(range(1, settings.shapes_per_scene + 1))
     masks = {instance_id: instance_labels == instance_id for instance_id in instance_ids}
     centroids = {
@@ -363,8 +371,15 @@ def generate_scene(
             rng = np.random.default_rng([seed, stage, attempt])
             try:
                 labels, shape_params = pack_scene(rng, stage_settings, scale, log=log)
+                appearance_rng = np.random.default_rng([seed, stage, attempt, 17])
+                scene_volume = render_appearance(labels, appearance_rng, stage_settings.appearance)
                 examples = build_examples(
-                    scene_id, seed, labels, stage_settings, split=split
+                    scene_id,
+                    seed,
+                    labels,
+                    stage_settings,
+                    scene_volume=scene_volume,
+                    split=split,
                 )
             except ValidationError as error:
                 if log is not None:
@@ -386,7 +401,7 @@ def generate_scene(
                 seed=seed,
                 volume_shape=stage_settings.volume_shape,
                 spacing=stage_settings.spacing,
-                scene_volume=(labels != 0).astype(np.uint8),
+                scene_volume=scene_volume,
                 instance_labels=labels,
                 examples=examples,
                 attempts=attempts,

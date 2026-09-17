@@ -323,7 +323,10 @@ def run_occupancy_sanity(
         )
 
         masks = model.prepare_masks(moved["anchor_masks"])
-        occupancy = model.prepare_occupancy(moved["scene_volume"], masks)
+        occupancy = model.prepare_occupancy(
+            moved["occupancy"] if "occupancy" in moved else moved["scene_volume"],
+            masks,
+        )
         ids = moved.get("example_id")
         if isinstance(ids, str):
             ids = [ids]

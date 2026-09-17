@@ -3,11 +3,18 @@
 
 Writes, under ``--output-root``::
 
-    scenes/<scene_id>.npz        scene_volume + instance_labels (uint8, compressed)
+    scenes/<scene_id>/scene_volume.nii.gz
+    scenes/<scene_id>/instance_labels.nii.gz
+    examples/<example_id>/target_mask.nii.gz
+    examples/<example_id>/anchor_{slot}_{shape}.nii.gz
+    examples/<example_id>/anchor_union.nii.gz
     manifests/<split>.jsonl      one ExampleMetadata per retained example
     manifests/<split>_candidates.jsonl   all ten candidates (--keep-all-candidates)
     run_metadata.json            configs, seeds, versions, git revision, hardware,
                                  exact counts and the rejection log
+
+Training rematerialises masks from ``instance_labels``; the example NIfTIs are
+for inspection in ITK-SNAP / 3D Slicer.
 
 Scene seeds come from ``configs/split.yaml``; target-class filtering comes from
 the same file. Every example is validated before it is written, and a scene that
@@ -49,7 +56,10 @@ from src.data.scene_generator import (  # noqa: E402
 from src.data.schema import (  # noqa: E402
     SCHEMA_VERSION,
     ExampleMetadata,
+    example_array_dir,
+    save_example_arrays,
     save_scene_arrays,
+    scene_array_dir,
     write_manifest,
 )
 from src.data.validation import RejectionLog, validate_split_assignment  # noqa: E402
@@ -191,14 +201,14 @@ def resolve_plan(
 
 def prepare_output(root: Path, overwrite: bool) -> None:
     """Create the output tree, refusing to clobber an existing dataset."""
-    scenes, manifests = root / "scenes", root / "manifests"
-    existing = [path for path in (scenes, manifests) if path.exists() and any(path.iterdir())]
+    scenes, examples, manifests = root / "scenes", root / "examples", root / "manifests"
+    existing = [path for path in (scenes, examples, manifests) if path.exists() and any(path.iterdir())]
     if existing and not overwrite:
         raise SystemExit(
             f"{root} already contains a dataset ({', '.join(str(p) for p in existing)}). "
             "Pass --overwrite to replace it."
         )
-    for path in (scenes, manifests):
+    for path in (scenes, examples, manifests):
         if path.exists() and overwrite:
             shutil.rmtree(path)
         path.mkdir(parents=True, exist_ok=True)
@@ -225,9 +235,10 @@ def build_split(
     for seed in range(start, end):
         scene = generate_scene(seed, settings=settings, split=name, log=log)
         save_scene_arrays(
-            output_root / "scenes" / f"{scene.scene_id}.npz",
+            scene_array_dir(output_root, scene.scene_id),
             scene.scene_volume,
             scene.instance_labels,
+            scene.spacing,
         )
         report.scenes += 1
         report.scene_attempts += scene.attempts
@@ -237,6 +248,13 @@ def build_split(
             metadata = example.metadata
             report.candidates += 1
             candidates.append(metadata)
+            dump = keep_all_candidates or metadata.target_shape_name in allowed
+            if dump:
+                save_example_arrays(
+                    example_array_dir(output_root, metadata.example_id),
+                    example.arrays,
+                    metadata,
+                )
             if metadata.target_shape_name in allowed:
                 retained.append(metadata)
                 report.per_target_counts[metadata.target_shape_name] = (

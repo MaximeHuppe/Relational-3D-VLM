@@ -52,8 +52,8 @@ channel is T1/T2. Instance maps and the target identity stay out.
 
 ## What the extra channel is (and is not)
 
-`scene_volume` is the binary foreground of **all ten** shapes, already stored
-per scene in `data/processed/scenes/<scene_id>.npz`. Schema check: it equals
+`scene_volume` on disk is the MRI-like intensity image. Occupancy for the
+decoder is the binary foreground of **all ten** shapes, derived from
 `instance_labels != 0`. It has **no instance ids**, no class colours, no
 target highlight.
 

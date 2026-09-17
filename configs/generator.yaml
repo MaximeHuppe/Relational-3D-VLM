@@ -1,8 +1,8 @@
 # Synthetic scene generation (Phase 1 implementation; contract fixed here).
 
-generator_version: "1.0.0"
+generator_version: "2.0.0"
 direction_rule_version: "1.0.0"   # must match src.data.direction_rules.DIRECTION_RULE_VERSION
-schema_version: "1.0.0"           # must match src.data.schema.SCHEMA_VERSION
+schema_version: "2.0.0"           # must match src.data.schema.SCHEMA_VERSION
 vocabulary_version: "1.0.0"       # must match configs/shapes.yaml
 
 geometry:
@@ -10,8 +10,20 @@ geometry:
   spacing: [1.0, 1.0, 1.0]        # world units per voxel, ordered (x, y, z)
   coordinate_frame: RAS           # x right/lateral, y anterior, z superior
   in_bounds_margin_voxels: 2      # every object must stay this far from the border
-  foreground_value: 1
-  background_value: 0
+
+# MRI-like intensities painted onto packed labels. Geometry stays binary in
+# instance_labels; only scene_volume is a float image. Structure means share
+# one overlapping range so Stage A cannot classify by brightness.
+appearance:
+  enabled: true
+  background_mean: 0.12
+  background_std: 0.04
+  structure_mean_range: [0.45, 0.75]
+  structure_mean_jitter: 0.05
+  intra_object_std: 0.03
+  class_bias: 0.04                 # small T1-like offset; still overlapping
+  partial_volume_sigma_voxels: 0.6
+  clip: [0.0, 1.0]
 
 packing:
   shapes_per_scene: 10            # exactly one instance of each class
@@ -46,11 +58,11 @@ examples:
 
 storage:
   root: data/processed
-  # Scene arrays (scene_volume, instance_labels) are written once per scene;
-  # example records reference their scene and carry all metadata. Masks are
-  # materialised deterministically from instance_labels on load, and the loader
-  # re-runs the channel/order consistency checks. See docs/dataset_schema.md.
-  scene_array_format: npz_compressed
+  # Per scene: scenes/<scene_id>/{scene_volume,instance_labels}.nii.gz
+  # Per example (inspection only): examples/<example_id>/{target,anchors,union}.nii.gz
+  # Training rematerialises masks from instance_labels. See docs/dataset_schema.md.
+  scene_array_format: nifti_gz
+  example_array_format: nifti_gz
   example_manifest_format: jsonl
   # Manifests hold only the examples retained by the target-class filter.
   # --keep-all-candidates additionally writes <split>_candidates.jsonl with all

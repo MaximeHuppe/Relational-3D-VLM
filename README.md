@@ -64,8 +64,8 @@ counterfactual battery and the qualitative 3D dumps (`scripts/evaluate.py`,
 .venv/bin/python scripts/generate_dataset.py --limit 10 --output-root /tmp/try
 ```
 
-The full run writes `data/processed/{scenes,manifests,run_metadata.json}` and
-takes roughly a minute; generated volumes stay out of git.
+The full run writes `data/processed/{scenes,examples,manifests,run_metadata.json}`
+as RAS `.nii.gz` volumes plus JSONL manifests; generated volumes stay out of git.
 
 ## Training Stage A
 
@@ -101,7 +101,7 @@ from is one flag:
 
 | `--anchor-source` | Three channels are |
 | --- | --- |
-| `oracle` (default) | the ground-truth masks: `data/processed/scenes/<scene>.npz` with everything but the three named anchor structures dropped |
+| `oracle` (default) | the ground-truth masks: `data/processed/scenes/<scene>/instance_labels.nii.gz` with everything but the three named anchor structures dropped |
 | `predicted` | Stage A's segmentation of those same three shape names, in prompt order |
 
 A predicted run also reports the anchor masks' own Dice/IoU, so a drop against

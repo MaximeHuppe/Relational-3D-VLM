@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Phase 1: train the Stage A promptable shape segmenter.
 
-One sample is a whole scene: the binary ``scene_volume`` goes in, one mask logit
+One sample is a whole scene: the intensity ``scene_volume`` goes in, one mask logit
 volume comes out per requested shape name. The target-class split filter does
 not apply here - it constrains which classes Stage B may be *supervised* on,
 while Stage A must learn all ten shapes so it can supply anchors by name in

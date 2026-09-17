@@ -17,7 +17,7 @@ stage_a:
   #      at ten names, so a learned table is the deterministic equivalent and
   #      keeps the text path free of synonyms.
   name: voxdense_shape_segmenter
-  in_channels: 1                  # binary scene_volume
+  in_channels: 1                  # intensity scene_volume
   num_prompts: 10                 # one mask logit per requested shape name
   stem_channels: 32
   encoder_channels: [32, 64, 128, 256]

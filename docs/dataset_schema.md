@@ -1,6 +1,6 @@
 # Dataset schema
 
-Schema version `1.0.0` (`src.data.schema.SCHEMA_VERSION`).
+Schema version `2.0.0` (`src.data.schema.SCHEMA_VERSION`).
 
 An **example** is one `(scene, target)` pair. Every scene yields ten candidate
 examples, one per instance; the target-class filter in `configs/split.yaml`
@@ -42,7 +42,7 @@ table; `assert_complete()` checks it.
 | `seed` | `int` | the scene seed that produced this example |
 | `volume_shape` | `(int, int, int)` | `(D, H, W)` actually used |
 | `spacing` | `(float, float, float)` | `(x, y, z)` world units per voxel |
-| `scene_volume` | `uint8 (D, H, W)` | binary foreground of the whole scene |
+| `scene_volume` | `float32 (D, H, W)` | MRI-like intensities of the whole scene |
 | `instance_labels` | `uint8 (D, H, W)` | `0` background, `1..10` shape IDs |
 | `target_instance_id` | `int` | `1..10` |
 | `target_shape_name` | `str` | vocabulary name; never appears in the prompt |
@@ -105,7 +105,11 @@ the scene and logs the rejection reason.
 
 ```text
 data/processed/
-  scenes/<scene_id>.npz              # scene_volume, instance_labels (uint8, compressed)
+  scenes/<scene_id>/scene_volume.nii.gz
+  scenes/<scene_id>/instance_labels.nii.gz
+  examples/<example_id>/target_mask.nii.gz
+  examples/<example_id>/anchor_{slot}_{shape}.nii.gz
+  examples/<example_id>/anchor_union.nii.gz
   manifests/<split>.jsonl            # one ExampleMetadata per retained example
   manifests/<split>_candidates.jsonl # all ten candidates (--keep-all-candidates)
   run_metadata.json                  # configs, seeds, versions, git revision,
@@ -118,14 +122,23 @@ data/smoke/                          # same layout, written by the smoke run
 smoke run uses to check that every shape occurs as a target and as an anchor.
 
 `scene_volume` and `instance_labels` are identical across the ten examples of a
-scene, so they are stored once per scene. `target_mask`, `anchor_masks` and
-`anchor_union_mask` are materialised from `instance_labels` by the declared
-instance IDs (`ExampleArrays.from_scene`), and every consistency check is re-run
-at load time: exactly ten instances, no empty object, target not in any anchor
-channel, each channel equal to its declared anchor, anchor order identical to
-prompt order, and prompt round-trip. A mismatch raises rather than being
-repaired. Large arrays stay out of git; manifests, schemas, configs and the
-small fixture batch are committed.
+scene, so they are stored once per scene as RAS NIfTI. `target_mask`,
+`anchor_masks` and `anchor_union_mask` are materialised from `instance_labels`
+by the declared instance IDs (`ExampleArrays.from_scene`); inspection copies of
+those masks are also written under `examples/<example_id>/`. Training loaders
+do not read the example NIfTIs. Every consistency check is re-run at load time:
+exactly ten instances, no empty object, target not in any anchor channel, each
+channel equal to its declared anchor, structure mean intensity above background,
+anchor order identical to prompt order, and prompt round-trip. A mismatch
+raises rather than being repaired. Large arrays stay out of git; manifests,
+schemas, configs and the small fixture batch are committed.
+
+NIfTI arrays are stored `(x, y, z)` RAS with affine `diag(sx, sy, sz, 1)`.
+In-memory arrays remain `(z, y, x)`. `src.data.nifti_io` is the only allowed
+transpose.
+
+`scene_volume` is a float image. Binary occupancy for Stage B is
+`(instance_labels != 0)` at load time.
 
 ## Stage B input contract
 
@@ -136,6 +149,8 @@ may consume: `anchor_masks`, `scene_volume`, `structured_prompt`, `prompt`,
 
 `STAGE_B_FORBIDDEN_FIELDS` — `instance_labels`, `target_mask`,
 `target_shape_name`, `target_instance_id`, `target_centroid_world` — must never
-reach Stage B. Binary `scene_volume` is occupancy (no instance ids) and is a
-decoder input. `anchor_union_mask` is reachable only through
-`stage_b_inputs(..., use_union_mask=True)`, which is the ablation baseline.
+reach Stage B. Binary occupancy derived from `instance_labels` (no instance
+ids) is the decoder WHAT stream; `stage_b_model_inputs` passes it as
+`scene_volume`. The intensity image is a Stage A input. `anchor_union_mask` is
+reachable only through `stage_b_inputs(..., use_union_mask=True)`, which is the
+ablation baseline.

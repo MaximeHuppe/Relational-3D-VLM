@@ -6,9 +6,10 @@ be run two ways:
 
 ``oracle``
     the ground-truth masks, materialised from ``instance_labels`` in
-    ``data/processed/scenes/*.npz`` by keeping only the three anchor structures
-    the prompt names. This isolates the relational architecture from Stage A's
-    errors and is the primary proof-of-concept measurement (Phase 3).
+    ``data/processed/scenes/<scene_id>/instance_labels.nii.gz`` by keeping only
+    the three anchor structures the prompt names. This isolates the relational
+    architecture from Stage A's errors and is the primary proof-of-concept
+    measurement (Phase 3).
 
 ``predicted``
     Stage A is run on the scene volume and asked for exactly the three shape
@@ -23,9 +24,8 @@ The two providers are interchangeable at the call site::
     output = model(**stage_b_model_inputs(batch, masks))
 
 Note what the predicted provider does *not* do: it never turns the scene into
-``instance_labels``. The same binary ``scene_volume`` has two consumers —
-Stage A produces the three ordered anchors from it, and Stage B's decoder
-reads it as occupancy — and both still go through
+``instance_labels``. The intensity ``scene_volume`` goes to Stage A; binary
+occupancy derived from labels is the decoder WHAT stream. Both still go through
 :func:`src.data.dataset.stage_b_model_inputs`. Instance maps stay out.
 
 The predicted provider also scores its own output against the ground-truth

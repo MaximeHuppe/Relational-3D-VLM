@@ -53,7 +53,7 @@ been needed at the configured sizes.
 
 ## Stage A (Phase 1)
 
-A promptable residual 3D U-Net: binary `scene_volume` in, one mask logit volume
+A promptable residual 3D U-Net: intensity `scene_volume` in, one mask logit volume
 per requested shape name out. Architecture, training, loss, metrics and dataset
 are in `docs/flowchart/phase1_encoder_decoder.drawio` and
 `docs/stage_a_architecture.md`.
@@ -91,8 +91,8 @@ Every Stage B run picks where its three channels come from, and the model is
 identical either way:
 
 ```bash
---anchor-source oracle      # ground-truth: load data/processed/scenes/<scene>.npz
-                            # and keep only the three anchor structures the prompt names
+--anchor-source oracle      # ground-truth: load instance_labels.nii.gz
+                            # and keep only the three named anchors
 --anchor-source predicted   # Stage A segments the scene and returns its masks for
                             # those same three names (needs --stage-a-checkpoint)
 ```

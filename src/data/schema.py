@@ -18,20 +18,21 @@ Layering
 
 Storage
 -------
-``scene_volume`` and ``instance_labels`` are identical for the ten examples of a
-scene, so they are written once per scene (``scenes/<scene_id>.npz``) and the
-per-example manifest is a JSONL file of ``ExampleMetadata``. The masks are then
-materialised deterministically from ``instance_labels`` by the declared
-instance IDs, and :meth:`ExampleArrays.validate` re-runs every consistency check
-at load time, so a mismatch between a channel and its declared anchor is caught
-rather than hidden. See ``docs/dataset_schema.md``.
+``scene_volume`` (float MRI-like image) and ``instance_labels`` are identical
+for the ten examples of a scene, so they are written once per scene as RAS
+NIfTI files under ``scenes/<scene_id>/``. The per-example manifest is a JSONL
+file of ``ExampleMetadata``. Masks are materialised from ``instance_labels`` by
+the declared instance IDs; inspection copies are also dumped under
+``examples/<example_id>/``. :meth:`ExampleArrays.validate` re-runs every
+consistency check at load time. See ``docs/dataset_schema.md``.
 
 Stage B contract
 ----------------
 :data:`STAGE_B_FORBIDDEN_FIELDS` names the fields the relational model must
-never see: instance ids and every ``target_*`` field. Binary ``scene_volume``
-(occupancy, no instance colours) is allowed as the decoder-side WHAT stream.
-:func:`stage_b_inputs` returns only the permitted subset.
+never see: instance ids and every ``target_*`` field. Binary occupancy derived
+from ``instance_labels`` (no instance colours, not the intensity image) is the
+decoder-side WHAT stream. :func:`stage_b_inputs` returns only the permitted
+subset. The intensity ``scene_volume`` is a Stage A input.
 """
 
 from __future__ import annotations
@@ -44,6 +45,7 @@ from typing import Any, Iterable, Iterator, Mapping, Sequence
 import numpy as np
 
 from src.data.direction_rules import DIRECTION_RULE_VERSION, validate_distinct_directions
+from src.data.nifti_io import load_nifti, save_nifti
 from src.data.primitives import SHAPE_VOCABULARY, VOCABULARY_VERSION
 from src.data.prompt_generator import (
     NUM_CLAUSES,
@@ -54,7 +56,7 @@ from src.data.prompt_generator import (
     validate_clauses,
 )
 
-SCHEMA_VERSION = "1.0.0"
+SCHEMA_VERSION = "2.0.0"
 
 NUM_ANCHORS = 3
 BACKGROUND_LABEL = SHAPE_VOCABULARY.background_label
@@ -93,8 +95,9 @@ VERSION_FIELDS: tuple[str, ...] = (
     "schema_version",
 )
 
-#: Stage B must never receive these, in any form. Occupancy (``scene_volume``)
-#: is allowed; instance ids and every target identity field are not.
+#: Stage B must never receive these, in any form. Binary occupancy derived from
+#: labels is allowed as the decoder WHAT stream; instance ids and every target
+#: identity field are not. The intensity ``scene_volume`` is a Stage A input.
 STAGE_B_FORBIDDEN_FIELDS: tuple[str, ...] = (
     "instance_labels",
     "target_mask",
@@ -106,7 +109,9 @@ STAGE_B_FORBIDDEN_FIELDS: tuple[str, ...] = (
 #: The union mask is an ablation-baseline input only, never the main input.
 STAGE_B_ABLATION_ONLY_FIELDS: tuple[str, ...] = ("anchor_union_mask",)
 
-#: What the relational model is allowed to consume.
+#: What the relational model is allowed to consume. ``scene_volume`` here is the
+#: binary occupancy stream the decoder still names that way (see
+#: :func:`src.data.dataset.stage_b_model_inputs`); it is not the intensity image.
 STAGE_B_ALLOWED_FIELDS: tuple[str, ...] = (
     "anchor_masks",
     "scene_volume",
@@ -118,6 +123,11 @@ STAGE_B_ALLOWED_FIELDS: tuple[str, ...] = (
     "volume_shape",
     "spacing",
 )
+
+SCENE_VOLUME_FILENAME = "scene_volume.nii.gz"
+INSTANCE_LABELS_FILENAME = "instance_labels.nii.gz"
+TARGET_MASK_FILENAME = "target_mask.nii.gz"
+ANCHOR_UNION_FILENAME = "anchor_union.nii.gz"
 
 
 class SchemaError(ValueError):
@@ -398,11 +408,16 @@ class ExampleMetadata:
 class ExampleArrays:
     """The five volumes of one example."""
 
-    scene_volume: np.ndarray  # (D, H, W) binary foreground
+    scene_volume: np.ndarray  # (D, H, W) float MRI-like intensities
     instance_labels: np.ndarray  # (D, H, W), 0 = background, 1..10 = instances
     target_mask: np.ndarray  # (D, H, W) binary
     anchor_masks: np.ndarray  # (3, D, H, W) binary, ordered by clause slot
     anchor_union_mask: np.ndarray  # (D, H, W) binary, ablation baseline only
+
+    @property
+    def occupancy(self) -> np.ndarray:
+        """Binary foreground of all ten shapes, derived from labels not the image."""
+        return (np.asarray(self.instance_labels) != BACKGROUND_LABEL).astype(np.uint8)
 
     def validate(self, metadata: ExampleMetadata) -> None:
         """Check every array against the metadata. Fail fast, never repair."""
@@ -425,10 +440,13 @@ class ExampleArrays:
                 f"instances plus background; found labels {labels.tolist()}"
             )
 
-        if not np.array_equal(
-            np.asarray(self.scene_volume, dtype=bool), self.instance_labels != BACKGROUND_LABEL
-        ):
-            raise SchemaError("scene_volume does not match the instance_labels foreground")
+        foreground = np.asarray(self.instance_labels) != BACKGROUND_LABEL
+        image = np.asarray(self.scene_volume, dtype=np.float32)
+        if foreground.any() and (~foreground).any():
+            if float(image[foreground].mean()) <= float(image[~foreground].mean()):
+                raise SchemaError(
+                    "scene_volume mean intensity inside structures must exceed background"
+                )
 
         expected_target = self.instance_labels == metadata.target_instance_id
         if not np.array_equal(np.asarray(self.target_mask, dtype=bool), expected_target):
@@ -521,6 +539,8 @@ def stage_b_inputs(example: Example, *, use_union_mask: bool = False) -> dict[st
     mask; that configuration is the ablation baseline, never the main model.
     """
     inputs: dict[str, Any] = {name: example.field(name) for name in STAGE_B_ALLOWED_FIELDS}
+    # Stage B's decoder WHAT stream is binary occupancy, never the intensity image.
+    inputs["scene_volume"] = example.arrays.occupancy
     if use_union_mask:
         inputs.pop("anchor_masks")
         inputs["anchor_union_mask"] = example.field("anchor_union_mask")
@@ -559,20 +579,72 @@ def read_manifest(path: Path | str) -> Iterator[ExampleMetadata]:
                 raise SchemaError(f"{path}:{line_number}: {error}") from error
 
 
+def scene_array_dir(root: Path | str, scene_id: str) -> Path:
+    """Directory holding the two shared per-scene NIfTIs."""
+    return Path(root) / "scenes" / scene_id
+
+
+def example_array_dir(root: Path | str, example_id: str) -> Path:
+    """Directory holding the per-example inspection NIfTIs."""
+    return Path(root) / "examples" / example_id
+
+
+def anchor_mask_filename(slot: int, shape_name: str) -> str:
+    return f"anchor_{slot}_{shape_name}.nii.gz"
+
+
 def save_scene_arrays(
-    path: Path | str, scene_volume: np.ndarray, instance_labels: np.ndarray
-) -> None:
-    """Write the two shared per-scene volumes."""
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        path,
-        scene_volume=np.asarray(scene_volume, dtype=np.uint8),
-        instance_labels=np.asarray(instance_labels, dtype=np.uint8),
+    directory: Path | str,
+    scene_volume: np.ndarray,
+    instance_labels: np.ndarray,
+    spacing: Sequence[float],
+) -> Path:
+    """Write the two shared per-scene volumes as RAS ``.nii.gz`` files."""
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    save_nifti(
+        directory / SCENE_VOLUME_FILENAME,
+        np.asarray(scene_volume, dtype=np.float32),
+        spacing,
+        dtype=np.float32,
     )
+    save_nifti(
+        directory / INSTANCE_LABELS_FILENAME,
+        np.asarray(instance_labels, dtype=np.uint8),
+        spacing,
+        dtype=np.uint8,
+    )
+    return directory
 
 
-def load_scene_arrays(path: Path | str) -> tuple[np.ndarray, np.ndarray]:
-    """Read the two shared per-scene volumes."""
-    with np.load(Path(path)) as data:
-        return data["scene_volume"], data["instance_labels"]
+def load_scene_arrays(directory: Path | str) -> tuple[np.ndarray, np.ndarray]:
+    """Read the two shared per-scene volumes from a scene directory."""
+    directory = Path(directory)
+    if directory.suffix == ".npz":
+        raise SchemaError(
+            f"scene arrays are NIfTI directories now; refused legacy npz path {directory}"
+        )
+    scene_volume = load_nifti(directory / SCENE_VOLUME_FILENAME, dtype=np.float32)
+    instance_labels = load_nifti(directory / INSTANCE_LABELS_FILENAME, dtype=np.uint8)
+    return scene_volume, instance_labels
+
+
+def save_example_arrays(
+    directory: Path | str,
+    arrays: ExampleArrays,
+    metadata: ExampleMetadata,
+) -> Path:
+    """Write per-example masks as RAS ``.nii.gz`` files for inspection."""
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    spacing = metadata.spacing
+    save_nifti(directory / TARGET_MASK_FILENAME, arrays.target_mask, spacing, dtype=np.uint8)
+    for slot, shape_name in enumerate(metadata.anchor_shape_names):
+        save_nifti(
+            directory / anchor_mask_filename(slot, shape_name),
+            arrays.anchor_masks[slot],
+            spacing,
+            dtype=np.uint8,
+        )
+    save_nifti(directory / ANCHOR_UNION_FILENAME, arrays.anchor_union_mask, spacing, dtype=np.uint8)
+    return directory

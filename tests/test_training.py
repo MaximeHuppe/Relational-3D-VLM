@@ -225,8 +225,9 @@ def test_dataset_items_match_the_stage_a_contract(smoke_dataset):
     assert set(item["target_masks"].unique().tolist()) <= {0.0, 1.0}
     # Every class is present exactly once per scene, so no mask may be empty.
     assert (item["target_masks"].sum(dim=(1, 2, 3)) > 0).all()
-    # The masks partition the foreground.
-    assert torch.equal(item["target_masks"].sum(dim=0), item["scene_volume"][0])
+    # The masks partition the foreground occupancy, not the intensity image.
+    occupancy = (item["instance_labels"] != 0).to(item["target_masks"].dtype)
+    assert torch.equal(item["target_masks"].sum(dim=0), occupancy)
 
 
 def test_dataset_masks_follow_the_requested_prompt_order():

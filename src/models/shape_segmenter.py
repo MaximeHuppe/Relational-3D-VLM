@@ -1,6 +1,6 @@
 """Stage A: full-volume promptable shape segmenter.
 
-A 3D residual U-Net that takes the binary ``scene_volume`` and a set of
+A 3D residual U-Net that takes the intensity ``scene_volume`` and a set of
 shape-name prompts, and returns one mask logit volume per prompt. This is the
 synthetic analogue of the future MRI anatomy segmenter that will supply anchor
 masks, and it is what Phase 4 uses to extract the three requested anchors by
@@ -338,7 +338,7 @@ class ShapeSegmenter(nn.Module):
         *,
         deep_supervision: bool = True,
     ) -> ShapeSegmenterOutput:
-        """Segment the requested shape names from a binary scene volume.
+        """Segment the requested shape names from an intensity scene volume.
 
         Args:
             scene_volume: ``[B, 1, D, H, W]`` float tensor.

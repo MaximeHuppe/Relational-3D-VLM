@@ -6,8 +6,8 @@ target/prediction misalignment, without depending on any particular accuracy.
 
 The anchor-source tests are the important ones: they check that the ground-truth
 and Stage A-predicted paths are interchangeable, that the predicted path really
-does swap the channels, and that the same ``scene_volume`` goes to Stage A and
-Stage B while ``instance_labels`` still does not.
+does swap the channels, that Stage A sees the intensity image, that Stage B
+sees binary occupancy, and that ``instance_labels`` still does not.
 """
 
 from __future__ import annotations
@@ -96,14 +96,17 @@ def test_items_match_the_stage_b_contract(dataset):
     assert float(item["anchor_masks"].sum(0).max()) == 1.0
     assert float((item["anchor_masks"].sum(0) * item["target_mask"][0]).sum()) == 0.0
     assert item["scene_volume"].shape == (1, depth, height, width)
-    assert set(item["scene_volume"].unique().tolist()) <= {0.0, 1.0}
+    assert item["occupancy"].shape == (1, depth, height, width)
+    assert set(item["occupancy"].unique().tolist()) <= {0.0, 1.0}
+    assert not set(item["scene_volume"].unique().tolist()) <= {0.0, 1.0}
 
 
 def test_the_channels_are_the_three_anchor_structures_of_the_scene(dataset):
-    """Oracle anchors = the .npz labels with everything but the anchors dropped."""
+    """Oracle anchors = instance_labels with everything but the anchors dropped."""
+    from src.data.schema import load_scene_arrays
+
     record = dataset.records[0]
-    with np.load(record.path) as arrays:
-        labels = arrays["instance_labels"]
+    _, labels = load_scene_arrays(record.path)
     item = dataset[0]
     for slot, instance_id in enumerate(record.metadata.anchor_instance_ids):
         expected = torch.from_numpy((labels == instance_id).astype("float32"))
@@ -127,7 +130,8 @@ def test_oracle_items_include_scene_volume_as_a_stage_b_input(dataset):
     assert item["scene_volume"].shape == (1, *dataset.volume_shape)
     inputs = stage_b_model_inputs(item)
     assert "scene_volume" in inputs
-    assert torch.equal(inputs["scene_volume"], item["scene_volume"])
+    assert torch.equal(inputs["scene_volume"], item["occupancy"])
+    assert not torch.equal(inputs["scene_volume"], item["scene_volume"])
     assert "target_mask" not in inputs
     assert "target_shape_name" not in inputs
 
@@ -248,7 +252,7 @@ def test_stage_b_gets_the_same_interface_from_either_source(scene_dataset):
             "anchor_shape_ids",
             "scene_volume",
         }
-        assert torch.equal(inputs["scene_volume"], batch["scene_volume"])
+        assert torch.equal(inputs["scene_volume"], batch["occupancy"])
         for forbidden in STAGE_B_FORBIDDEN_FIELDS:
             assert forbidden not in inputs
         assert "instance_labels" not in inputs

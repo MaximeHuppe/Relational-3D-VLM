@@ -8,8 +8,9 @@ supervised on, while Stage A must learn all ten shapes in every split - so
 that split's manifest.
 
 Stage B consumes *examples*: one sample is one ``(scene, target)`` pair - three
-ordered anchor channels, a three-clause prompt, the binary scene occupancy, and
-the target mask that supervises it - read from the same manifests.
+ordered anchor channels, a three-clause prompt, the binary scene occupancy
+derived from ``instance_labels``, the intensity ``scene_volume`` for Stage A,
+and the target mask that supervises it - read from the same manifests.
 :class:`ExampleDataset` is filtered by ``configs/split.yaml`` at generation time,
 so it yields only the target classes a split is allowed to supervise.
 
@@ -36,7 +37,14 @@ from torch.utils.data import DataLoader, Dataset
 
 from src.data.primitives import SHAPE_NAMES, SHAPE_VOCABULARY
 from src.data.prompt_generator import clause_indices
-from src.data.schema import ExampleArrays, ExampleMetadata, load_scene_arrays, read_manifest
+from src.data.schema import (
+    BACKGROUND_LABEL,
+    ExampleArrays,
+    ExampleMetadata,
+    load_scene_arrays,
+    read_manifest,
+    scene_array_dir,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - `src.data` must not import `src.training`
     from src.training.augmentations import RotationAugmentation
@@ -71,8 +79,10 @@ def scene_records(root: Path | str, split: str) -> list[SceneRecord]:
     for metadata in read_manifest(manifest):
         if metadata.scene_id in records:
             continue
-        path = root / "scenes" / f"{metadata.scene_id}.npz"
-        if not path.is_file():
+        path = scene_array_dir(root, metadata.scene_id)
+        if not (path / "scene_volume.nii.gz").is_file() or not (
+            path / "instance_labels.nii.gz"
+        ).is_file():
             raise DatasetError(f"missing scene arrays {path}")
         records[metadata.scene_id] = SceneRecord(
             scene_id=metadata.scene_id,
@@ -91,7 +101,7 @@ class SceneDataset(Dataset):
 
     Each item is a dict with:
 
-    ``scene_volume``  ``[1, D, H, W]`` float32, the binary scene;
+    ``scene_volume``  ``[1, D, H, W]`` float32, the MRI-like intensity image;
     ``prompt_ids``    ``[N_T]`` int64, zero-based vocabulary indices;
     ``target_masks``  ``[N_T, D, H, W]`` float32, aligned with ``prompt_ids``;
     ``instance_labels`` ``[D, H, W]`` int64, kept for qualitative output;
@@ -104,7 +114,7 @@ class SceneDataset(Dataset):
             full vocabulary in canonical order.
         limit: keep only the first N scenes (smoke runs).
         cache: hold the scenes in memory to keep I/O out of the training loop.
-            Only the two compact uint8 volumes are cached (~0.52 MB per scene);
+            Only the compact volumes are cached (float32 image + uint8 labels);
             the float tensors and the per-shape masks are derived per item.
             Caching the derived tensors instead would cost ~13.6 MB per scene -
             5.4 GB for a 400-scene split, multiplied again by every persistent
@@ -168,12 +178,12 @@ class SceneDataset(Dataset):
             self.augment.set_epoch(epoch)
 
     def _volumes(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """The two compact uint8 volumes of a scene, cached as stored on disk."""
+        """The intensity image and labels of a scene, cached as stored on disk."""
         if self._cache is not None and index in self._cache:
             return self._cache[index]
         scene_volume, instance_labels = load_scene_arrays(self.records[index].path)
         volumes = (
-            torch.from_numpy(np.ascontiguousarray(scene_volume, dtype=np.uint8)),
+            torch.from_numpy(np.ascontiguousarray(scene_volume, dtype=np.float32)),
             torch.from_numpy(np.ascontiguousarray(instance_labels, dtype=np.uint8)),
         )
         if self._cache is not None:
@@ -291,8 +301,10 @@ def example_records(
             continue
         if wanted_targets is not None and metadata.target_shape_name not in wanted_targets:
             continue
-        path = root / "scenes" / f"{metadata.scene_id}.npz"
-        if not path.is_file():
+        path = scene_array_dir(root, metadata.scene_id)
+        if not (path / "scene_volume.nii.gz").is_file() or not (
+            path / "instance_labels.nii.gz"
+        ).is_file():
             raise DatasetError(f"missing scene arrays {path}")
         records.append(ExampleRecord(metadata=metadata, path=path))
     if not records:
@@ -313,17 +325,20 @@ class ExampleDataset(Dataset):
     ``anchor_shape_ids``   ``[3]`` int64, zero-based shape indices - these double
                            as Stage A's ``prompt_ids`` when anchors are predicted;
     ``anchor_union_mask``  ``[1, D, H, W]`` float32, ablation baseline only;
-    ``scene_volume``       ``[1, D, H, W]`` float32, binary occupancy of the
-                           whole scene. Always present by default. Stage A
-                           consumes it to predict anchors; Stage B's decoder
-                           consumes the same tensor as the WHAT stream.
+    ``scene_volume``       ``[1, D, H, W]`` float32, MRI-like intensity image.
+                           Always present by default. Stage A consumes it to
+                           predict anchors.
+    ``occupancy``          ``[1, D, H, W]`` float32, binary foreground derived
+                           from ``instance_labels``. Stage B's decoder WHAT
+                           stream. Not the intensity image.
     plus ``example_id``, ``scene_id``, ``prompt``, ``target_shape_name``,
     ``anchor_shape_names``, ``directions`` and ``rotation`` for reporting and
     stratification.
 
     The target mask is the label, never an input: :func:`stage_b_model_inputs`
     is the only sanctioned way to build the model's arguments from an item, and
-    it passes the anchor channels, the two index tensors and ``scene_volume``.
+    it passes the anchor channels, the two index tensors and binary occupancy
+    (under the model argument name ``scene_volume``).
     Instance labels and every ``target_*`` field stay behind.
 
     Args:
@@ -333,9 +348,9 @@ class ExampleDataset(Dataset):
         scene_ids: restrict to these scenes (Phase 2 overfits on one).
         target_shapes: restrict to these target classes; the manifest is already
             filtered by ``configs/split.yaml``, so this is a further narrowing.
-        include_scene_volume: return the binary scene occupancy. On by default
-            because Stage B's decoder needs it; predicted-anchor runs also
-            feed the same tensor to Stage A.
+        include_scene_volume: return the intensity image. On by default because
+            predicted-anchor runs feed it to Stage A. Binary occupancy is always
+            on the item for Stage B's decoder.
         validate: re-run the full schema validation on the first visit to each
             scene. Cheap (once per scene) and fails fast on a corrupt corpus.
         cache: hold decoded ``instance_labels`` in memory, one copy per scene
@@ -452,6 +467,7 @@ class ExampleDataset(Dataset):
             prompt = plan.prompt
             rotation_code = plan.rotation.code
 
+        occupancy = (labels != BACKGROUND_LABEL).astype(np.float32)
         anchor_masks = np.stack(
             [(labels == instance_id) for instance_id in metadata.anchor_instance_ids]
         ).astype(np.float32)
@@ -464,6 +480,7 @@ class ExampleDataset(Dataset):
             "anchor_union_mask": torch.from_numpy(
                 anchor_masks.max(axis=0)
             ).unsqueeze(0),
+            "occupancy": torch.from_numpy(occupancy).unsqueeze(0),
             "direction_ids": torch.tensor(directions, dtype=torch.long),
             "anchor_shape_ids": torch.tensor(shape_ids, dtype=torch.long),
             "example_id": metadata.example_id,
@@ -511,15 +528,18 @@ def stage_b_model_inputs(
     """The only sanctioned way to call Stage B from a batch.
 
     Returns exactly ``{anchor_masks, direction_ids, anchor_shape_ids, scene_volume}``.
-    ``anchor_masks`` may be overridden with predicted channels; everything else
-    in the batch - the target mask above all - stays behind.
+    ``scene_volume`` is binary occupancy (from ``batch["occupancy"]`` when
+    present), never the intensity image. ``anchor_masks`` may be overridden
+    with predicted channels; everything else in the batch - the target mask
+    above all - stays behind.
     """
     masks = batch["anchor_masks"] if anchor_masks is None else anchor_masks
+    occupancy = batch["occupancy"] if "occupancy" in batch else batch["scene_volume"]
     return {
         "anchor_masks": masks,
         "direction_ids": batch["direction_ids"],
         "anchor_shape_ids": batch["anchor_shape_ids"],
-        "scene_volume": batch["scene_volume"],
+        "scene_volume": occupancy,
     }
 
 

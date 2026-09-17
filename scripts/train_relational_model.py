@@ -27,18 +27,18 @@ Anchor source
 -------------
 Both phases accept either anchor source, and it is the same model either way::
 
-    --anchor-source oracle       ground-truth masks: the .npz volume under
-                                 data/processed is loaded and only the three
-                                 anchor structures the prompt names are kept
+    --anchor-source oracle       ground-truth masks: instance_labels under
+                                 data/processed/scenes/<scene_id>/ is loaded
+                                 and only the three named anchors are kept
     --anchor-source predicted    Stage A segments the scene and its masks for
                                  those same three names are used instead
                                  (needs --stage-a-checkpoint)
 
 With predicted anchors the run also reports the anchor masks' own Dice/IoU, so a
 drop against the oracle run can be attributed to Stage A rather than guessed at.
-The scene volume is loaded for every Stage B run: Stage A (predicted anchors)
-and the Stage B decoder (occupancy) are its two consumers. Instance labels
-never reach Stage B.
+The intensity scene volume is loaded for Stage A (predicted anchors). Binary
+occupancy derived from labels is the Stage B decoder WHAT stream. Instance
+labels never reach Stage B.
 
 After oracle training, overfit, and ``--eval-only``, the run also prints an
 occupancy sanity report (prompt permutation / direction flip with occupancy

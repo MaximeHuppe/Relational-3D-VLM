@@ -22,10 +22,10 @@ model(anchor_masks, direction_ids, anchor_shape_ids, scene_volume)
 The forward signature is the contract. `instance_labels`, `target_mask`,
 `target_shape_name`, `target_instance_id` and `target_centroid_world` —
 `src.data.schema.STAGE_B_FORBIDDEN_FIELDS` — have nowhere to go.
-`scene_volume` is occupancy: binary foreground of all ten shapes, no instance
-ids, no target highlight. The training loop's only model call goes through
-`src.data.dataset.stage_b_model_inputs`, which returns those four tensors;
-`tests/test_stage_b_contract.py` pins both ends down.
+`scene_volume` is occupancy: binary foreground of all ten shapes, **derived
+from `instance_labels`**, not the MRI-like intensity image Stage A sees. No
+instance ids, no target highlight. `src.data.dataset.stage_b_model_inputs`
+maps `batch["occupancy"]` onto this argument.
 
 ## WHERE / WHAT
 
@@ -173,15 +173,15 @@ convolution before they can observe any input sensitivity.
 
 | Source | What the three channels are | Used by |
 | --- | --- | --- |
-| `oracle` | ground-truth masks: `data/processed/scenes/<scene>.npz` is loaded and only the three anchor structures the prompt names are kept | Phases 2-3 |
+| `oracle` | ground-truth masks from `instance_labels.nii.gz`, keeping only the three named anchors | Phases 2-3 |
 | `predicted` | Stage A segments `scene_volume` and returns its masks for those same three names, in clause order | Phase 4 |
 
 `anchor_shape_ids` *is* Stage A's `prompt_ids`, so the predicted channels come
 back already aligned with the clauses. The predicted provider also scores its
 own output against the ground-truth channels (`anchor_dice`, `anchor_iou`,
 `empty_anchor_fraction`) so a Stage B drop can be attributed rather than guessed
-at. The same `scene_volume` goes into Stage A (anchors) and Stage B (occupancy).
-It still must not become `instance_labels`.
+at. Intensity `scene_volume` goes into Stage A (anchors). Binary occupancy
+derived from labels goes into Stage B. Neither path may become `instance_labels`.
 
 ## Baseline variants
 

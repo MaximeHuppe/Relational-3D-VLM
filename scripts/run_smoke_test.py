@@ -60,6 +60,7 @@ from src.data.schema import (  # noqa: E402
     ExampleArrays,
     load_scene_arrays,
     read_manifest,
+    scene_array_dir,
 )
 from src.data.validation import (  # noqa: E402
     validate_example,
@@ -83,7 +84,7 @@ def load_examples(root: Path, manifest: Path, margin_voxels: int) -> list[Exampl
     for metadata in read_manifest(manifest):
         if metadata.scene_id not in scene_cache:
             scene_cache[metadata.scene_id] = load_scene_arrays(
-                root / "scenes" / f"{metadata.scene_id}.npz"
+                scene_array_dir(root, metadata.scene_id)
             )
         scene_volume, instance_labels = scene_cache[metadata.scene_id]
         example = Example(
@@ -250,7 +251,7 @@ def run(argv: Sequence[str] | None = None) -> int:
     print("MEASURED GEOMETRY PER CLASS (design band: 8-22% of the axis)")
     print("-" * 78)
     low, high = SHAPE_VOCABULARY.axis_extent_fraction_range
-    scene_paths = sorted((root / "scenes").glob("*.npz"))
+    scene_paths = sorted(path for path in (root / "scenes").iterdir() if path.is_dir())
     voxel_counts: dict[str, list[int]] = defaultdict(list)
     extent_fractions: dict[str, list[float]] = defaultdict(list)
     for path in scene_paths:

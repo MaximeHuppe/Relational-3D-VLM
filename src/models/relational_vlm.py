@@ -32,8 +32,9 @@ oracle) or Stage A's predictions for the three named anchors (Phase 4). Because
 every geometric feature is measured from the channels themselves
 (:mod:`src.models.structure_encoder`), the two sources are interchangeable and
 the oracle-vs-predicted delta measures Stage A's error, not a change of
-interface. The same ``scene_volume`` tensor that Stage A segments is also
-passed to this decoder. See :mod:`src.models.anchor_provider`.
+interface. Stage A segments the intensity ``scene_volume``; this decoder
+receives binary occupancy derived from labels (still named ``scene_volume`` on
+the forward signature). See :mod:`src.models.anchor_provider`.
 
 Baseline variants (``configs/model.yaml: baselines``) are selected by
 :class:`RelationalVLMConfig`: ``full`` (the main model), ``anchor_masks_only``
@@ -403,7 +404,8 @@ class RelationalVLM(nn.Module):
             direction_ids: ``[B, 3]`` zero-based direction indices.
             anchor_shape_ids: ``[B, 3]`` zero-based shape indices.
             scene_volume: ``[B, 1, D, H, W]`` binary occupancy of the whole
-                scene. Passed to the decoder only; the encoder never sees it.
+                scene (derived from labels, not the intensity image). Passed to
+                the decoder only; the encoder never sees it.
             return_evidence: also return the three 8^3 evidence maps.
         """
         if direction_ids.shape != anchor_shape_ids.shape:

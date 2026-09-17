@@ -1018,10 +1018,10 @@ def test_the_scene_volume_channel_rotates_with_the_masks():
     dataset.set_epoch(3)
     for index in range(len(dataset)):
         item = dataset[index]
-        occupancy = item["scene_volume"][0].numpy() > 0
+        occupancy = item["occupancy"][0].numpy() > 0.5
         union = item["anchor_masks"].numpy().max(axis=0) > 0.5
         target = item["target_mask"][0].numpy() > 0.5
-        # Every labelled voxel is occupied in the rotated scene volume.
+        # Every labelled voxel is occupied in the rotated occupancy map.
         assert np.all(occupancy[union])
         assert np.all(occupancy[target])
 
