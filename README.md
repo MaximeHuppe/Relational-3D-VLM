@@ -11,7 +11,7 @@ segment the shape that is lateral to the cube, superior to the pyramid, and ante
 The target shape is never an input. The model must infer it from the
 intersection of the three relations. `docs/CLAUDE.md` is the full specification.
 
-## Status — Phases 0-3 implemented
+## Status — Phases 0-4 implemented
 
 Implemented:
 
@@ -51,9 +51,15 @@ Phases 2–3 (Stage B), implemented:
   (clean train Dice 0.953 after 864 steps), and a 40-epoch smoke Phase 3 reaches
   validation Dice 0.186 on the two never-supervised target classes.
 
-Not started: the Phase 4 report proper — the baseline sweep, the scored
-counterfactual battery and the qualitative 3D dumps (`scripts/evaluate.py`,
-`src/evaluation/{counterfactuals,qualitative}.py`).
+Phase 4 (evaluation), implemented:
+
+- `scripts/evaluate.py` and `src/evaluation/predictions.py` — pick a Stage A and
+  a Stage B checkpoint, score them on a split and keep every predicted mask next
+  to its target in a self-describing prediction folder.
+
+Not started: the rest of the Phase 4 report — the four-way baseline sweep, the
+scored counterfactual battery and the qualitative 3D dumps
+(`src/evaluation/{counterfactuals,qualitative}.py`).
 
 ## Generating data
 
@@ -109,6 +115,49 @@ the oracle run can be attributed to Stage A instead of guessed at. Results,
 stratified by target shape, anchor shape, direction and clause slot, land in
 `runs/stage_b_*/`.
 
+## Evaluating a checkpoint pair on the test set
+
+`scripts/evaluate.py` is the Phase 4 entry point: choose one Stage A and one
+Stage B checkpoint, score them on a split (`test` by default) and keep every
+predicted mask next to the target it was scored against.
+
+```bash
+.venv/bin/python scripts/evaluate.py \
+    --stage-b-checkpoint runs/relational_model/predicted/dataset_custom/best.pt \
+    --stage-a-checkpoint runs/shape_segmenter/shapeSeg_dataset_custom/best.pt
+
+# ground-truth anchors instead, for the oracle-versus-predicted delta
+.venv/bin/python scripts/evaluate.py --anchor-source oracle \
+    --stage-b-checkpoint runs/relational_model/predicted/dataset_custom/best.pt
+```
+
+```text
+predictions/<stage_b>__anchors-predicted-<stage_a>__test/
+  run_metadata.json          both checkpoint paths, both run names, SHA-256,
+                             the training provenance of each, configs, git rev
+  metrics.json / metrics.txt aggregate + stratified Dice / IoU / Hausdorff,
+                             plus the predicted anchors' own Dice/IoU
+  predictions.jsonl          one row per example: prompt, scores, file paths
+  predictions/<example_id>/prediction_mask.nii.gz
+                            target_mask.nii.gz
+```
+
+The model *name* recorded for each stage defaults to the run directory its
+checkpoint sits in (`shapeSeg_dataset_custom`, `dataset_custom` — every run
+writes a `best.pt`, so the directory is what tells two of them apart);
+`--stage-a-name` / `--stage-b-name` override it. `--save-probabilities` and
+`--save-anchors` add the float32 probability volume and the three anchor
+channels Stage B actually consumed; `--no-volumes` scores without writing any.
+An existing folder is never clobbered without `--overwrite`.
+
+Test-set result for the committed pair (50 examples, target class
+`triangular_prism`, never supervised):
+
+| Anchors | Anchor Dice | Target Dice | Target IoU | Hausdorff |
+| --- | --- | --- | --- | --- |
+| oracle | – | 0.9869 | 0.9777 | 3.01 |
+| predicted (`shapeSeg_dataset_custom`) | 0.9872 | 0.9838 | 0.9718 | 3.67 |
+
 ## Setup
 
 ```bash
@@ -129,7 +178,7 @@ src/data/    primitives, voxelization, scene_generator, direction_rules,
 src/models/  Stage A segmenter, Stage B encoder/decoder, prompt and structure
              encoders, cross-modal and intersection fusion
 src/training/  losses, trainer, augmentations, checkpointing
-src/evaluation/  metrics, counterfactuals, qualitative
+src/evaluation/  metrics, predictions, counterfactuals, qualitative
 scripts/     generate_dataset, train_shape_segmenter, train_relational_model,
              evaluate, run_smoke_test
 tests/       direction rules, primitives, anchor selection, prompt/schema,

@@ -176,10 +176,55 @@ examples, two anchor sources:
 The anchor column is what makes the target column interpretable: this Stage A
 was itself a 40-epoch smoke run, so the drop is an anchor-quality result, not a
 relational one. A full-corpus Stage A is the prerequisite for reading the delta
-as anything else. The wider Phase 4 deliverables — the baseline
-sweep, the counterfactual battery and the qualitative dumps — are not
-implemented yet (`src/evaluation/counterfactuals.py`,
-`src/evaluation/qualitative.py`, `scripts/evaluate.py`).
+as anything else.
+
+### Phase 4 — test-set predictions
+
+`--eval-only` scores a checkpoint and throws the masks away. `scripts/evaluate.py`
+is the other half: it takes the two checkpoints explicitly, runs the same
+forward pass on a split (`test` by default) and writes every prediction next to
+the target it was scored against.
+
+```bash
+.venv/bin/python scripts/evaluate.py \
+    --stage-b-checkpoint runs/relational_model/predicted/dataset_custom/best.pt \
+    --stage-a-checkpoint runs/shape_segmenter/shapeSeg_dataset_custom/best.pt
+```
+
+One folder is one `(Stage A checkpoint, Stage B checkpoint, split)` triple:
+
+```text
+predictions/<stage_b>__anchors-predicted-<stage_a>__test/
+  run_metadata.json          both checkpoint paths and run names, each
+                             checkpoint's SHA-256 and training provenance,
+                             the config snapshot, the git revision, the command
+  metrics.json / metrics.txt aggregate + stratified Dice / IoU / Hausdorff and
+                             the predicted anchors' own Dice / IoU
+  predictions.jsonl          one row per example: prompt, per-example scores,
+                             the files written
+  predictions/<example_id>/prediction_mask.nii.gz, target_mask.nii.gz
+```
+
+The recorded name of each model defaults to the run directory its checkpoint
+sits in — every run writes a `best.pt`, so a folder of masks that records only
+`best.pt` is unattributable a week later — and `--stage-a-name` /
+`--stage-b-name` override it.
+
+On the 500-scene corpus, 50 test examples, target class `triangular_prism`
+(never supervised), Stage B `dataset_custom` with Stage A
+`shapeSeg_dataset_custom`:
+
+| Anchors | Anchor Dice | Target Dice | Target IoU | Hausdorff |
+| --- | --- | --- | --- | --- |
+| oracle | — | 0.9869 | 0.9777 | 3.01 |
+| predicted | 0.9872 | 0.9838 | 0.9718 | 3.67 |
+
+Here the anchors are good, so the 0.003 Dice gap is the whole cost of running
+end to end rather than an anchor-quality artefact.
+
+The remaining Phase 4 deliverables — the four-way baseline sweep, the
+counterfactual battery and the qualitative dumps — are not implemented yet
+(`src/evaluation/counterfactuals.py`, `src/evaluation/qualitative.py`).
 
 ## Reports
 

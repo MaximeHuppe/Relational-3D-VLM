@@ -9,6 +9,7 @@ data/**/*.nii
 data/**/*.nii.gz
 !data/fixtures/
 runs/
+predictions/
 checkpoints/
 outputs/
 wandb/
