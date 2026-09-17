@@ -2,7 +2,7 @@
 """Phases 2-4: train and evaluate the Stage B relational target segmenter.
 
 One sample is one ``(scene, target)`` example: three ordered anchor-mask
-channels, a three-clause prompt and the binary scene occupancy go in, one
+channels, a three-clause prompt and the scene image go in, one
 target logit volume comes out. The target shape is never an input - the model
 has to find the region that satisfies all three relations at once.
 

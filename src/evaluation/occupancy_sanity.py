@@ -1,17 +1,25 @@
 """Occupancy sanity checks: prompt use, train/val split, one object not the union.
 
-High Dice after adding decoder occupancy is expected — WHAT can copy a connected
-component once WHERE is roughly right. These checks catch the failure mode that
-Dice hides: the model ignoring the prompt and painting a remaining blob, or
-painting every remaining blob.
+High Dice after adding the decoder's WHAT stream is expected — WHAT can copy a
+connected component once WHERE is roughly right. These checks catch the failure
+mode that Dice hides: the model ignoring the prompt and painting a remaining
+blob, or painting every remaining blob.
 
-1. Flip one direction / permute channels with occupancy **fixed**. The binary
-   mask should move or collapse. If it barely changes, the model is prompt-
-   invariant.
+1. Flip one direction / permute channels with the WHAT stream **fixed**. The
+   binary mask should move or collapse. If it barely changes, the model is
+   prompt-invariant.
 2. Compare train Dice to val Dice. Both high → localisation is generalising.
-   Train high / val low → WHERE is still the problem, not occupancy.
+   Train high / val low → WHERE is still the problem, not the WHAT stream.
 3. A qualitative slice plus a component count: the prediction should overlap
-   **one** remaining occupancy object, not the union of the seven.
+   **one** remaining scene object, not the union of the seven.
+
+The component count runs on the batch's ``scene_occupancy`` — the binary
+foreground derived from the labels — and not on the model's WHAT stream. Since
+the WHAT stream became a simulated acquisition, thresholding it at 0.5 returns
+the whole head as one component, which would make check 3 pass vacuously
+forever. ``scene_occupancy`` is analysis-only and never reaches the model; a
+batch without it (an older corpus, or a hand-built fixture) falls back to the
+WHAT stream, which is still correct when that stream is binary.
 """
 
 from __future__ import annotations
@@ -36,8 +44,8 @@ PROMPT_INVARIANT_DICE = 0.85
 HIGH_DICE = 0.80
 #: Train minus val at or above this, with train high, is a WHERE failure.
 LOCALISATION_GAP = 0.20
-#: Dice(pred, occupancy) above this means the prediction is the remaining union
-#: (one of seven similar-sized objects scores around 0.25).
+#: Dice(pred, remaining occupancy) above this means the prediction is the
+#: remaining union (one of seven similar-sized objects scores around 0.25).
 UNION_OCCUPANCY_DICE = 0.50
 #: Fraction of predicted voxels that must sit inside occupancy.
 INSIDE_OCCUPANCY = 0.80
@@ -130,6 +138,27 @@ def _volume(tensor: Tensor) -> np.ndarray:
     while array.ndim > 3:
         array = array[0]
     return array
+
+
+def remaining_object_occupancy(
+    batch: Mapping[str, Any], model: nn.Module, masks: Tensor
+) -> Tensor:
+    """The scene's objects minus the three named anchors, as a binary volume.
+
+    This is what "one object, not the union" is counted on. It comes from the
+    batch's label-derived ``scene_occupancy`` when the loader supplies one,
+    because the model's WHAT stream is an intensity image and cannot be
+    thresholded into objects. Falling back to the WHAT stream keeps hand-built
+    fixtures and appearance-free corpora working, where that stream *is* the
+    binary occupancy.
+
+    Analysis only: nothing here is ever passed to the model.
+    """
+    occupancy = batch.get("scene_occupancy")
+    if occupancy is None:
+        return model.prepare_occupancy(batch["scene_volume"], masks)
+    anchors = batch["anchor_masks"].to(torch.float32)
+    return occupancy.to(torch.float32) * (1.0 - anchors.amax(dim=1, keepdim=True))
 
 
 def occupancy_carving(
@@ -323,7 +352,7 @@ def run_occupancy_sanity(
         )
 
         masks = model.prepare_masks(moved["anchor_masks"])
-        occupancy = model.prepare_occupancy(moved["scene_volume"], masks)
+        occupancy = remaining_object_occupancy(moved, model, masks)
         ids = moved.get("example_id")
         if isinstance(ids, str):
             ids = [ids]

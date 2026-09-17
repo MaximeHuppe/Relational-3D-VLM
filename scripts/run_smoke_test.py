@@ -54,11 +54,11 @@ from src.data.direction_rules import (  # noqa: E402
 )
 from src.data.primitives import SHAPE_NAMES, SHAPE_VOCABULARY, VOCABULARY_VERSION  # noqa: E402
 from src.data.prompt_generator import assert_no_target_leakage  # noqa: E402
+from src.data.scene_io import load_scene, scene_path  # noqa: E402
 from src.data.schema import (  # noqa: E402
     SCHEMA_VERSION,
     Example,
     ExampleArrays,
-    load_scene_arrays,
     read_manifest,
 )
 from src.data.validation import (  # noqa: E402
@@ -76,15 +76,23 @@ def check(condition: bool, message: str) -> None:
         raise SmokeFailure(message)
 
 
+def scene_paths_under(root: Path) -> list[Path]:
+    """Every scene of a corpus, in either on-disk format, in scene-ID order."""
+    scenes = root / "scenes"
+    directories = [path for path in scenes.iterdir() if path.is_dir()] if scenes.is_dir() else []
+    if directories:
+        return sorted(directories)
+    return sorted(scenes.glob("*.npz"))
+
+
 def load_examples(root: Path, manifest: Path, margin_voxels: int) -> list[Example]:
     """Re-read a manifest and rebuild every example from the scene arrays on disk."""
     scene_cache: dict[str, tuple[np.ndarray, np.ndarray]] = {}
     examples: list[Example] = []
     for metadata in read_manifest(manifest):
         if metadata.scene_id not in scene_cache:
-            scene_cache[metadata.scene_id] = load_scene_arrays(
-                root / "scenes" / f"{metadata.scene_id}.npz"
-            )
+            volumes = load_scene(scene_path(root, metadata.scene_id))
+            scene_cache[metadata.scene_id] = (volumes.occupancy, volumes.instance_labels)
         scene_volume, instance_labels = scene_cache[metadata.scene_id]
         example = Example(
             metadata=metadata,
@@ -250,11 +258,11 @@ def run(argv: Sequence[str] | None = None) -> int:
     print("MEASURED GEOMETRY PER CLASS (design band: 8-22% of the axis)")
     print("-" * 78)
     low, high = SHAPE_VOCABULARY.axis_extent_fraction_range
-    scene_paths = sorted((root / "scenes").glob("*.npz"))
+    scene_paths = scene_paths_under(root)
     voxel_counts: dict[str, list[int]] = defaultdict(list)
     extent_fractions: dict[str, list[float]] = defaultdict(list)
     for path in scene_paths:
-        _, labels = load_scene_arrays(path)
+        labels = load_scene(path).instance_labels
         axis_length = max(labels.shape)
         for spec in SHAPE_VOCABULARY:
             mask = labels == spec.id

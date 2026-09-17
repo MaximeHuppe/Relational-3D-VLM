@@ -225,8 +225,33 @@ def test_dataset_items_match_the_stage_a_contract(smoke_dataset):
     assert set(item["target_masks"].unique().tolist()) <= {0.0, 1.0}
     # Every class is present exactly once per scene, so no mask may be empty.
     assert (item["target_masks"].sum(dim=(1, 2, 3)) > 0).all()
-    # The masks partition the foreground.
+    # The masks partition the foreground - checked against the labels, because
+    # the scene volume is now an intensity image and no longer *is* the
+    # foreground.
+    foreground = (item["instance_labels"] != 0).to(torch.float32)
+    assert torch.equal(item["target_masks"].sum(dim=0), foreground)
+
+
+def test_stage_a_segments_an_image_whose_background_is_tissue_not_zero(smoke_dataset):
+    """Stage A is the stand-in for the future anatomy segmenter on real MRI.
+
+    It only stands in for one if its input is an acquisition: continuous, noisy
+    and with structures embedded in tissue. A binary volume would let it
+    threshold, which is the thing that made the previous milestone unlike MRI.
+    """
+    item = smoke_dataset[0]
+    image = item["scene_volume"][0]
+    assert len(image.unique()) > 1000
+    background = image[item["instance_labels"] == 0]
+    assert float(background.std()) > 0.0
+    assert float((background > 0.2 * float(image.max())).float().mean()) > 0.4
+
+
+def test_the_occupancy_source_reproduces_the_binary_stage_a_input():
+    dataset = SceneDataset(SMOKE_ROOT, "train", limit=1, image_source="occupancy")
+    item = dataset[0]
     assert torch.equal(item["target_masks"].sum(dim=0), item["scene_volume"][0])
+    assert set(item["scene_volume"].unique().tolist()) <= {0.0, 1.0}
 
 
 def test_dataset_masks_follow_the_requested_prompt_order():

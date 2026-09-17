@@ -11,6 +11,11 @@ segment the shape that is lateral to the cube, superior to the pyramid, and ante
 The target shape is never an input. The model must infer it from the
 intersection of the three relations. `docs/CLAUDE.md` is the full specification.
 
+Scenes are **MRI-like**: structures sit inside a simulated head at a few percent
+contrast, with partial-volume edges, tissue texture, a receive-coil bias field
+and Rician noise, and are written as NIfTI (`.nii.gz`). See
+`docs/mri_appearance.md`.
+
 ## Status — Phases 0-3 implemented
 
 Implemented:
@@ -18,6 +23,9 @@ Implemented:
 - repository scaffold and the five configs (`configs/`);
 - the fixed ten-shape vocabulary (`configs/shapes.yaml`, `src/data/primitives.py`);
 - the direction rules and their rejection cases (`src/data/direction_rules.py`);
+- the MRI-like appearance model and the NIfTI corpus layout
+  (`configs/appearance.yaml`, `src/data/{appearance,nifti_io,scene_io}.py`) —
+  see `docs/mri_appearance.md`;
 - the canonical prompt renderer/parser and nearest-feasible anchor selection
   (`src/data/prompt_generator.py`);
 - analytic voxelisers for all ten primitives (`src/data/voxelization.py`);
@@ -58,14 +66,62 @@ counterfactual battery and the qualitative 3D dumps (`scripts/evaluate.py`,
 ## Generating data
 
 ```bash
-.venv/bin/python scripts/run_smoke_test.py                 # 8 scenes, generate + validate
+.venv/bin/python scripts/run_smoke_test.py                 # 24 scenes, generate + validate
 .venv/bin/python scripts/generate_dataset.py --smoke       # smoke corpus only
 .venv/bin/python scripts/generate_dataset.py               # full 500-scene corpus
 .venv/bin/python scripts/generate_dataset.py --limit 10 --output-root /tmp/try
 ```
 
 The full run writes `data/processed/{scenes,manifests,run_metadata.json}` and
-takes roughly a minute; generated volumes stay out of git.
+takes roughly four minutes; generated volumes stay out of git.
+
+Each scene is a directory of NIfTI volumes plus a JSON record:
+
+```text
+scenes/<scene_id>/
+  image.nii.gz                 the simulated MRI-like volume
+  labels.nii.gz                instance labels, 0 and 1..10
+  occupancy.nii.gz             binary foreground
+  masks/<id>_<name>.nii.gz     one binary mask per structure
+  examples/<example_id>_{target,anchors}.nii.gz + .json
+  scene.json                   seeds, placed parameters, appearance draws
+```
+
+Redundant on purpose: any scene, or any single example, opens in ITK-SNAP,
+FSLeyes or 3D Slicer without deriving anything. The frame is RAS with a
+`diag(spacing, 1)` affine, so a centroid printed by a manifest is the coordinate
+a viewer shows. `docs/dataset_schema.md` has the full layout.
+
+To look at what was generated:
+
+```bash
+.venv/bin/python scripts/preview_scene.py --root data/smoke --limit 4
+.venv/bin/python scripts/preview_scene.py --root data/smoke \
+    --scene scene_009000000 --example scene_009000000_target_01
+```
+
+PNG montages, no matplotlib needed: the three orthogonal planes of the image,
+the same planes with the labels over them, and the target and three ordered
+anchor channels of an example.
+
+### The appearance model
+
+`configs/appearance.yaml` decides what a scene looks like once its geometry is
+fixed: partial-volume edges, per-structure intensities on a tissue background, a
+scalp-like rim, two scales of texture, a bias field, and a k-space magnitude
+reconstruction that supplies Gibbs ringing and Rician noise. Two properties are
+load-bearing:
+
+- **intensity carries no class information.** Every structure's mean is drawn
+  from one shared distribution, so a model cannot recognise a class from its
+  grey level; the target stays reachable only through the three relations. Real
+  deep grey nuclei are near-isointense with each other too, so this is also the
+  faithful choice. A test guards it.
+- **geometry is untouched.** The appearance draws from a disjoint random stream,
+  so the same seed gives the same layout with or without an image. `enabled:
+  false` restores the previous milestone's binary volumes, and
+  `image_source="occupancy"` on either dataset gives the binary input without
+  regenerating anything — that is the baseline to compare against.
 
 ## Training Stage A
 
@@ -74,7 +130,7 @@ takes roughly a minute; generated volumes stay out of git.
 .venv/bin/python scripts/train_shape_segmenter.py           # full corpus
 ```
 
-Stage A segments any requested shape name from the binary scene, which is how
+Stage A segments any requested shape name from the scene image, which is how
 Phase 4 extracts the three anchors a prompt names. It is scored with per-class
 Dice and IoU; checkpoints land in `runs/stage_a[_smoke]/`.
 
@@ -101,7 +157,7 @@ from is one flag:
 
 | `--anchor-source` | Three channels are |
 | --- | --- |
-| `oracle` (default) | the ground-truth masks: `data/processed/scenes/<scene>.npz` with everything but the three named anchor structures dropped |
+| `oracle` (default) | the ground-truth masks: `data/processed/scenes/<scene>/labels.nii.gz` with everything but the three named anchor structures dropped |
 | `predicted` | Stage A's segmentation of those same three shape names, in prompt order |
 
 A predicted run also reports the anchor masks' own Dice/IoU, so a drop against
@@ -123,24 +179,27 @@ target hardware (MPS on Apple Silicon, CUDA on the RTX 5090).
 ## Layout
 
 ```text
-configs/     shapes, generator, split, model, train
-src/data/    primitives, voxelization, scene_generator, direction_rules,
-             prompt_generator, schema, validation
+configs/     shapes, generator, appearance, split, model, train
+src/data/    primitives, voxelization, appearance, scene_generator,
+             direction_rules, prompt_generator, schema, nifti_io, scene_io,
+             validation
 src/models/  Stage A segmenter, Stage B encoder/decoder, prompt and structure
              encoders, cross-modal and intersection fusion
 src/training/  losses, trainer, augmentations, checkpointing
 src/evaluation/  metrics, counterfactuals, qualitative
 scripts/     generate_dataset, train_shape_segmenter, train_relational_model,
-             evaluate, run_smoke_test
+             evaluate, run_smoke_test, preview_scene
 tests/       direction rules, primitives, anchor selection, prompt/schema,
              Stage A and Stage B model contracts, training, augmentations
-docs/        CLAUDE.md, dataset_schema.md, experiment_protocol.md,
-             stage_a_architecture.md, stage_b_architecture.md
+docs/        CLAUDE.md, dataset_schema.md, mri_appearance.md,
+             experiment_protocol.md, stage_a_architecture.md,
+             stage_b_architecture.md
 ```
 
 ## Conventions
 
 Arrays are indexed `(z, y, x)`; world coordinates are ordered `(x, y, z)` in a
-RAS frame (`x` right/lateral, `y` anterior, `z` superior). Directions come from
+RAS frame (`x` right/lateral, `y` anterior, `z` superior). NIfTI files store the
+transpose, `(i, j, k) = (x, y, z)`, with a `diag(spacing, 1)` affine. Directions come from
 a closed six-token vocabulary and are always described target-relative-to-anchor.
 See `docs/dataset_schema.md`.

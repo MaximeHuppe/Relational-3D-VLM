@@ -23,9 +23,9 @@ The two providers are interchangeable at the call site::
     output = model(**stage_b_model_inputs(batch, masks))
 
 Note what the predicted provider does *not* do: it never turns the scene into
-``instance_labels``. The same binary ``scene_volume`` has two consumers —
-Stage A produces the three ordered anchors from it, and Stage B's decoder
-reads it as occupancy — and both still go through
+``instance_labels``. The same ``scene_volume`` — the simulated MRI-like image —
+has two consumers: Stage A produces the three ordered anchors from it, and
+Stage B's decoder reads it as its WHAT stream. Both still go through
 :func:`src.data.dataset.stage_b_model_inputs`. Instance maps stay out.
 
 The predicted provider also scores its own output against the ground-truth

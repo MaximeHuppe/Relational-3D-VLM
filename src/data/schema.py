@@ -560,19 +560,34 @@ def read_manifest(path: Path | str) -> Iterator[ExampleMetadata]:
 
 
 def save_scene_arrays(
-    path: Path | str, scene_volume: np.ndarray, instance_labels: np.ndarray
+    path: Path | str,
+    scene_volume: np.ndarray,
+    instance_labels: np.ndarray,
+    image: np.ndarray | None = None,
 ) -> None:
-    """Write the two shared per-scene volumes."""
+    """Write a scene's shared volumes as a single compressed ``.npz``.
+
+    The NIfTI directory layout in :mod:`src.data.scene_io` is the default
+    format; this one stays for corpora that want a single file per scene.
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        path,
-        scene_volume=np.asarray(scene_volume, dtype=np.uint8),
-        instance_labels=np.asarray(instance_labels, dtype=np.uint8),
-    )
+    arrays: dict[str, np.ndarray] = {
+        "scene_volume": np.asarray(scene_volume, dtype=np.uint8),
+        "instance_labels": np.asarray(instance_labels, dtype=np.uint8),
+    }
+    if image is not None:
+        arrays["image"] = np.asarray(image, dtype=np.float32)
+    np.savez_compressed(path, **arrays)
 
 
 def load_scene_arrays(path: Path | str) -> tuple[np.ndarray, np.ndarray]:
-    """Read the two shared per-scene volumes."""
-    with np.load(Path(path)) as data:
-        return data["scene_volume"], data["instance_labels"]
+    """Read a scene's ``(scene_volume, instance_labels)``, in either format.
+
+    Kept for callers that only need the label-space arrays; use
+    :func:`src.data.scene_io.load_scene` to also get the simulated image.
+    """
+    from src.data.scene_io import load_scene
+
+    volumes = load_scene(path)
+    return volumes.occupancy, volumes.instance_labels

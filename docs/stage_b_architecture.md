@@ -2,7 +2,7 @@
 
 Phases 2-4 of the training procedure: the **relational target segmenter**. It
 takes three ordered binary anchor-mask channels, a three-clause prompt and the
-binary scene occupancy, and returns one target logit volume. The target shape
+scene image, and returns one target logit volume. The target shape
 is never an input — the model has to find the region that satisfies all three
 target-relative constraints at once. Occupancy tells it which voxels sit at
 that place; it does not name the target.

@@ -2,8 +2,10 @@
 
 Each dump is a mid-volume (or most-occupied) axial slice of occupancy, the
 prediction, the target, and an RGB overlay. Occupancy is the decoder WHAT
-stream — the binary scene with the three anchors zeroed — so a correct mask
-should light up one of those remaining components, not all of them.
+stream — the scene's objects with the three anchors removed — so a correct
+mask should light up one of those remaining components, not all of them. The
+volume passed in is the label-derived binary occupancy, not the intensity image
+the decoder sees, because components cannot be counted on an acquisition.
 """
 
 from __future__ import annotations

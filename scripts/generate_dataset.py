@@ -3,11 +3,20 @@
 
 Writes, under ``--output-root``::
 
-    scenes/<scene_id>.npz        scene_volume + instance_labels (uint8, compressed)
+    scenes/<scene_id>/image.nii.gz       the simulated MRI-like volume (float32)
+    scenes/<scene_id>/labels.nii.gz      instance labels, 0 and 1..10 (uint8)
+    scenes/<scene_id>/occupancy.nii.gz   binary foreground (uint8)
+    scenes/<scene_id>/masks/*.nii.gz     one binary mask per structure
+    scenes/<scene_id>/examples/*         per-example target, anchor stack, prompt
+    scenes/<scene_id>/scene.json         seeds, placed parameters, appearance draws
     manifests/<split>.jsonl      one ExampleMetadata per retained example
     manifests/<split>_candidates.jsonl   all ten candidates (--keep-all-candidates)
     run_metadata.json            configs, seeds, versions, git revision, hardware,
-                                 exact counts and the rejection log
+                                 exact counts, appearance statistics and the
+                                 rejection log
+
+With ``storage.scene_array_format: npz_compressed`` a scene is instead the
+single ``scenes/<scene_id>.npz`` file of the previous milestone.
 
 Scene seeds come from ``configs/split.yaml``; target-class filtering comes from
 the same file. Every example is validated before it is written, and a scene that
@@ -45,6 +54,17 @@ from src.data.direction_rules import DIRECTION_RULE_VERSION  # noqa: E402
 from src.data.scene_generator import (  # noqa: E402
     GeneratorSettings,
     generate_scene,
+    scene_record,
+)
+from src.data.scene_io import (  # noqa: E402
+    BIAS_FILE,
+    BODY_FILE,
+    FRACTION_FILE,
+    NIFTI_FORMAT,
+    NPZ_FORMAT,
+    TISSUE_FILE,
+    save_example_masks,
+    save_scene,
 )
 from src.data.schema import (  # noqa: E402
     SCHEMA_VERSION,
@@ -55,6 +75,34 @@ from src.data.schema import (  # noqa: E402
 from src.data.validation import RejectionLog, validate_split_assignment  # noqa: E402
 
 SPLIT_NAMES = ("train", "val", "test")
+
+
+@dataclass(frozen=True)
+class StorageOptions:
+    """How much of a scene is written to disk, from ``generator.storage``."""
+
+    scene_array_format: str
+    write_example_masks: bool
+    write_appearance_diagnostics: bool
+    image_dtype: str
+
+    @classmethod
+    def from_config(cls, config: Any | None = None) -> "StorageOptions":
+        storage = dict((config or load_config("generator"))["storage"])
+        fmt = str(storage.get("scene_array_format", NIFTI_FORMAT))
+        if fmt not in (NIFTI_FORMAT, NPZ_FORMAT):
+            raise SystemExit(
+                f"storage.scene_array_format must be {NIFTI_FORMAT!r} or {NPZ_FORMAT!r}, "
+                f"got {fmt!r}"
+            )
+        return cls(
+            scene_array_format=fmt,
+            write_example_masks=bool(storage.get("write_example_masks", True)),
+            write_appearance_diagnostics=bool(
+                storage.get("write_appearance_diagnostics", False)
+            ),
+            image_dtype=str(storage.get("image_dtype", "uint16")),
+        )
 
 
 @dataclass
@@ -98,6 +146,8 @@ class RunReport:
     elapsed_seconds: float
     smoke: bool
     kept_all_candidates: bool
+    storage: StorageOptions
+    appearance: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -111,6 +161,17 @@ class RunReport:
                 "direction_rule_version": DIRECTION_RULE_VERSION,
                 "vocabulary_version": VOCABULARY_VERSION,
                 "schema_version": SCHEMA_VERSION,
+                "appearance_version": self.settings.appearance.version,
+            },
+            "storage": {
+                "scene_array_format": self.storage.scene_array_format,
+                "write_example_masks": self.storage.write_example_masks,
+                "write_appearance_diagnostics": self.storage.write_appearance_diagnostics,
+                "image_dtype": self.storage.image_dtype,
+            },
+            "appearance": {
+                "enabled": self.settings.appearance.enabled,
+                **self.appearance,
             },
             "geometry": {
                 "volume_shape": list(self.settings.volume_shape),
@@ -204,6 +265,62 @@ def prepare_output(root: Path, overwrite: bool) -> None:
         path.mkdir(parents=True, exist_ok=True)
 
 
+def write_scene(
+    scene,
+    split: str,
+    output_root: Path,
+    storage: StorageOptions,
+    *,
+    retained_example_ids: Sequence[str] = (),
+) -> None:
+    """Write one accepted scene in the configured on-disk format."""
+    if storage.scene_array_format == NPZ_FORMAT:
+        save_scene_arrays(
+            output_root / "scenes" / f"{scene.scene_id}.npz",
+            scene.scene_volume,
+            scene.instance_labels,
+            image=scene.appearance.image if scene.appearance is not None else None,
+        )
+        return
+
+    diagnostics: dict[str, np.ndarray] = {}
+    if storage.write_appearance_diagnostics and scene.appearance is not None:
+        diagnostics = {
+            TISSUE_FILE: scene.appearance.tissue_image,
+            BIAS_FILE: scene.appearance.bias,
+            FRACTION_FILE: scene.appearance.structure_fraction,
+            BODY_FILE: (scene.appearance.body_fraction >= 0.5).astype(np.uint8),
+        }
+    save_scene(
+        output_root,
+        scene.scene_id,
+        instance_labels=scene.instance_labels,
+        occupancy=scene.scene_volume,
+        spacing=scene.spacing,
+        image=scene.appearance.image if scene.appearance is not None else None,
+        record=scene_record(scene, split=split),
+        extra_volumes=diagnostics,
+        image_dtype=storage.image_dtype,
+    )
+    if not storage.write_example_masks:
+        return
+    wanted = set(retained_example_ids)
+    for example in scene.examples:
+        metadata = example.metadata
+        if wanted and metadata.example_id not in wanted:
+            continue
+        save_example_masks(
+            output_root,
+            scene.scene_id,
+            metadata.example_id,
+            instance_labels=scene.instance_labels,
+            target_instance_id=metadata.target_instance_id,
+            anchor_instance_ids=metadata.anchor_instance_ids,
+            spacing=scene.spacing,
+            record=metadata.to_json_dict(),
+        )
+
+
 def build_split(
     name: str,
     seed_range: tuple[int, int],
@@ -213,6 +330,8 @@ def build_split(
     log: RejectionLog,
     *,
     keep_all_candidates: bool,
+    storage: StorageOptions,
+    appearance_stats: list[dict[str, Any]] | None = None,
     verbose: bool = True,
 ) -> SplitReport:
     """Generate one split: scenes to disk, metadata to the manifests."""
@@ -224,24 +343,32 @@ def build_split(
 
     for seed in range(start, end):
         scene = generate_scene(seed, settings=settings, split=name, log=log)
-        save_scene_arrays(
-            output_root / "scenes" / f"{scene.scene_id}.npz",
-            scene.scene_volume,
-            scene.instance_labels,
-        )
-        report.scenes += 1
-        report.scene_attempts += scene.attempts
-        if scene.volume_shape != settings.volume_shape:
-            report.escalated_scenes += 1
+        scene_retained: list[str] = []
         for example in scene.examples:
             metadata = example.metadata
             report.candidates += 1
             candidates.append(metadata)
             if metadata.target_shape_name in allowed:
                 retained.append(metadata)
+                scene_retained.append(metadata.example_id)
                 report.per_target_counts[metadata.target_shape_name] = (
                     report.per_target_counts.get(metadata.target_shape_name, 0) + 1
                 )
+        # Every candidate is written when the manifest keeps every candidate,
+        # so an inspected batch can open any of the ten.
+        write_scene(
+            scene,
+            name,
+            output_root,
+            storage,
+            retained_example_ids=() if keep_all_candidates else scene_retained,
+        )
+        report.scenes += 1
+        report.scene_attempts += scene.attempts
+        if scene.volume_shape != settings.volume_shape:
+            report.escalated_scenes += 1
+        if appearance_stats is not None and scene.appearance is not None:
+            appearance_stats.append(scene.appearance.parameters)
         if verbose and report.scenes % 50 == 0:
             print(f"  [{name}] {report.scenes} scenes, {len(retained)} retained examples")
 
@@ -250,6 +377,49 @@ def build_split(
     if keep_all_candidates:
         write_manifest(output_root / "manifests" / f"{name}_candidates.jsonl", candidates)
     return report
+
+
+def summarize_appearance(draws: Sequence[Any]) -> dict[str, Any]:
+    """Aggregate the per-scene appearance draws for ``run_metadata.json``.
+
+    The measured numbers are the interesting ones: they say how hard the corpus
+    actually is, rather than what the configuration asked for.
+    """
+    if not draws:
+        return {}
+
+    def spread(values: Sequence[float]) -> dict[str, float]:
+        array = np.asarray([v for v in values if v is not None], dtype=np.float64)
+        if array.size == 0:
+            return {}
+        return {
+            "mean": float(array.mean()),
+            "min": float(array.min()),
+            "max": float(array.max()),
+        }
+
+    measured = [draw["measured"] for draw in draws]
+    return {
+        "scenes": len(draws),
+        "structure_polarity": draws[0]["structure_polarity"],
+        "class_conditioned_intensities": draws[0]["class_conditioned_intensities"],
+        "drawn": {
+            "noise_sigma": spread([draw["noise_sigma"] for draw in draws]),
+            "kspace_fraction": spread([draw["kspace_fraction"] for draw in draws]),
+            "bias_inhomogeneity": spread([draw["bias_inhomogeneity"] for draw in draws]),
+            "parenchyma_intensity": spread([draw["parenchyma_intensity"] for draw in draws]),
+        },
+        "measured": {
+            "mean_contrast": spread([entry["mean_contrast"] for entry in measured]),
+            "tissue_background_std": spread(
+                [entry["tissue_background_std"] for entry in measured]
+            ),
+            "contrast_to_noise": spread([entry["contrast_to_noise"] for entry in measured]),
+            "contrast_to_background_variation": spread(
+                [entry["contrast_to_background_variation"] for entry in measured]
+            ),
+        },
+    }
 
 
 def build_dataset(
@@ -270,9 +440,11 @@ def build_dataset(
     prepare_output(root, overwrite)
 
     settings = GeneratorSettings.from_config()
+    storage = StorageOptions.from_config()
     log = RejectionLog()
     started = time.perf_counter()
     reports: dict[str, SplitReport] = {}
+    appearance_stats: list[dict[str, Any]] = []
     for name in splits:
         if verbose:
             print(f"[{name}] seeds {seed_ranges[name][0]}..{seed_ranges[name][1] - 1}")
@@ -284,6 +456,8 @@ def build_dataset(
             root,
             log,
             keep_all_candidates=keep_all,
+            storage=storage,
+            appearance_stats=appearance_stats,
             verbose=verbose,
         )
     elapsed = time.perf_counter() - started
@@ -296,6 +470,8 @@ def build_dataset(
         elapsed_seconds=elapsed,
         smoke=smoke,
         kept_all_candidates=keep_all,
+        storage=storage,
+        appearance=summarize_appearance(appearance_stats),
     )
     (root / "run_metadata.json").write_text(
         json.dumps(run.to_dict(), indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -335,6 +511,30 @@ def print_report(run: RunReport) -> None:
     escalated = sum(report.escalated_scenes for report in run.splits.values())
     if escalated:
         print(f"escalated scenes   : {escalated}")
+    print(f"scene format       : {run.storage.scene_array_format}")
+    appearance = run.appearance
+    if not run.settings.appearance.enabled:
+        print("appearance         : disabled (binary volumes)")
+    elif appearance:
+        measured = appearance["measured"]
+        drawn = appearance["drawn"]
+        print(
+            f"appearance         : polarity {appearance['structure_polarity']}, "
+            f"class-conditioned {appearance['class_conditioned_intensities']}"
+        )
+        print(
+            f"  contrast         : {measured['mean_contrast']['mean']:.3f} "
+            f"[{measured['mean_contrast']['min']:.3f}, {measured['mean_contrast']['max']:.3f}]"
+        )
+        print(
+            f"  noise sigma      : {drawn['noise_sigma']['mean']:.4f} "
+            f"[{drawn['noise_sigma']['min']:.4f}, {drawn['noise_sigma']['max']:.4f}]"
+        )
+        print(
+            f"  CNR / contrast-to-background-variation : "
+            f"{measured['contrast_to_noise']['mean']:.2f} / "
+            f"{measured['contrast_to_background_variation']['mean']:.2f}"
+        )
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:

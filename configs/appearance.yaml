@@ -1,0 +1,126 @@
+# MRI-like appearance model.
+#
+# The geometry of a scene (which shapes, where, how big) is unchanged by this
+# file: it is decided by `configs/generator.yaml` and `configs/shapes.yaml` and
+# drawn from a separate random stream. This file only decides what the scene
+# *looks like* once the geometry is fixed.
+#
+# Pipeline, in the order the physics happens:
+#
+#   1. partial volume   analytic solids are supersampled, so a boundary voxel
+#                       holds the fraction of its volume inside the solid
+#                       instead of a hard 0/1 - the dominant source of soft
+#                       edges in a real 1 mm acquisition;
+#   2. tissue map       every compartment (air, parenchyma, scalp rim, the ten
+#                       structures) gets an intensity, mixed by those fractions;
+#   3. texture          smooth multiplicative fields make each tissue spatially
+#                       heterogeneous rather than flat;
+#   4. bias field       one very smooth multiplicative field - the RF receive
+#                       inhomogeneity every scanner has;
+#   5. acquisition      FFT -> truncate k-space (blur + Gibbs ringing) -> add
+#                       complex Gaussian noise -> inverse FFT -> magnitude,
+#                       which is where Rician noise comes from.
+#
+# Every step is seeded from the scene seed, so an appearance is reproducible
+# from the seed alone and independent of the packing retries.
+
+appearance_version: "1.0.0"
+
+# Master switch. With `enabled: false` the corpus falls back to the binary
+# volumes of the previous milestone (foreground 1, background 0) and no image
+# is written.
+enabled: true
+
+partial_volume:
+  # Sub-samples per voxel edge: 4 means 64 samples per voxel, so a boundary
+  # fraction is quantised to 1/64. Computed inside each object's bounding box
+  # only, which is why it is cheap.
+  subdivisions: 4
+
+body:
+  # The "head": a superellipsoid filling most of the field of view. Structures
+  # live inside it, so the scene is no longer objects floating in a vacuum -
+  # each one has to be separated from surrounding tissue, not from air.
+  enabled: true
+  # Reject an object placement whose bounding box is not fully inside the body.
+  # This is the only way this file touches geometry; turn it off to keep the
+  # layouts bit-identical to an appearance-free corpus.
+  constrain_placement: true
+  # Fraction of each axis length used as the semi-axis, sampled per axis.
+  # Tuned together with `exponent` so that the placement constraint costs
+  # essentially nothing: the measured scene acceptance rate is the same as with
+  # the constraint off, because what rejects a scene is the anchor-triple rule,
+  # not the head outline.
+  semi_axis_fraction: [0.45, 0.49]
+  # Superellipsoid exponent: 2 is an ellipsoid, higher is a rounded box. Around
+  # 3 reads as a head rather than as a cube.
+  exponent: [2.5, 3.5]
+  center_jitter_voxels: 1.5
+  # Supersampling for the body fractions. It is a whole-volume evaluation, so
+  # it uses a smaller factor than the (windowed) object fractions.
+  subdivisions: 2
+  rim:
+    # A bright shell just inside the body boundary - scalp fat on T1. Purely
+    # cosmetic for the task, but it is what makes the volume read as a head.
+    enabled: true
+    thickness_voxels: [1.5, 3.0]
+
+intensities:
+  # Arbitrary units. The whole image is written as drawn; per-volume
+  # normalisation happens at load time (see `normalization` below).
+  air: 0.0
+  parenchyma: [0.55, 0.70]
+  rim: [0.80, 1.00]
+  # How far a structure's mean sits from the surrounding parenchyma, and how
+  # much that distance varies between structures in one scene.
+  structure_contrast: 0.15
+  structure_contrast_jitter: 0.04
+  # `darker`   every structure is below parenchyma (deep grey nuclei on T1);
+  # `brighter` every structure is above it (T2/FLAIR-like);
+  # `mixed`    the sign is drawn per structure;
+  # `random`   one sign is drawn per scene and used for all structures.
+  structure_polarity: darker
+  # Keep this false. True would give each shape class its own intensity band,
+  # which hands the model a shortcut: it could then recognise a class from its
+  # grey level instead of inferring the target from the three relations. Real
+  # deep grey structures are near-isointense with each other, which is exactly
+  # why relational and atlas priors matter, so `false` is also the faithful
+  # choice.
+  class_conditioned: false
+
+texture:
+  # Zero-mean Gaussian random fields, multiplied into the tissue map. Two
+  # scales: slow drift across the volume and fine grain inside it.
+  coarse:
+    correlation_voxels: 14.0
+    amplitude: 0.055
+  fine:
+    correlation_voxels: 3.0
+    amplitude: 0.022
+  # Draw an independent field per structure on top of the shared one, so two
+  # adjacent structures do not vary in lockstep.
+  per_structure_amplitude: 0.02
+
+bias_field:
+  enabled: true
+  # Peak-to-peak relative variation of the multiplicative field, e.g. 0.25 is
+  # roughly the 20-40% inhomogeneity BrainWeb offers.
+  inhomogeneity: [0.15, 0.30]
+  correlation_voxels: 40.0
+
+acquisition:
+  # Fraction of the Nyquist band actually sampled, per axis. Below 1 this
+  # blurs the image and rings at sharp edges, which is the Gibbs artefact.
+  kspace_fraction: [0.82, 0.94]
+  # Standard deviation of each of the two image-domain noise components. The
+  # magnitude reconstruction turns them into Rician noise, and into a Rayleigh
+  # floor in the air region. 0.02 against a 0.6 parenchyma is SNR ~30.
+  noise_sigma: [0.015, 0.03]
+
+normalization:
+  # Applied at load time, per volume, never baked into the stored image.
+  # `percentile` maps [p_low, p_high] to [0, 1]; `zscore` standardises the
+  # whole volume; `none` passes the stored values through.
+  mode: percentile
+  percentiles: [0.5, 99.5]
+  clip: [-0.5, 1.5]

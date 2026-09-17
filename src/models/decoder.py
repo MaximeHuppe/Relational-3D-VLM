@@ -178,7 +178,7 @@ class RelationalDecoder(nn.Module):
             bottleneck: the intersection-conditioned ``[B, C, 8, 8, 8]`` grid.
             skips: encoder features at 1/4, 1/2 and full resolution.
             context: ``[B, context_dim]`` relation-fused clause context.
-            occupancy: full-resolution binary scene ``[B, 1, D, H, W]``. Max-
+            occupancy: the full-resolution scene stream ``[B, 1, D, H, W]``. Max-
                 pooled onto each named decoder grid after the skip merge.
                 ``None`` skips the concat (ablation).
         """

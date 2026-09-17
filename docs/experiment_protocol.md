@@ -4,7 +4,7 @@
 
 | Phase | What runs | Status |
 | --- | --- | --- |
-| 0 | Data verification: geometry and prompt tests, inspected batch | **done** — `scripts/run_smoke_test.py` |
+| 0 | Data verification: geometry and prompt tests, inspected batch | **done** — `scripts/run_smoke_test.py`, `scripts/preview_scene.py` |
 | 1 | Stage A pretraining on all ten shapes | **implemented** — `scripts/train_shape_segmenter.py`; smoke run done, full-corpus run pending |
 | 2 | Stage B overfit on one scene | **implemented** — `scripts/train_relational_model.py --phase overfit`; smoke run passes (train Dice 0.95) |
 | 3 | Stage B oracle-anchor training (primary measurement) | **implemented** — `scripts/train_relational_model.py --phase oracle`; full-corpus run pending |
@@ -38,22 +38,31 @@ reported after generation and filtering.
 ## Generation
 
 ```bash
-.venv/bin/python scripts/run_smoke_test.py            # 8 scenes: generate + validate
+.venv/bin/python scripts/run_smoke_test.py            # 24 scenes: generate + validate
 .venv/bin/python scripts/generate_dataset.py          # full 500-scene corpus
+.venv/bin/python scripts/preview_scene.py --root data/processed --limit 4
 ```
 
 Scenes are packed by rejection sampling, largest classes first. A scene is
-rejected and regenerated whenever an object cannot be placed, a pair of
-centroids has no well-defined direction, or some target has no feasible
-three-direction anchor set; the reason is logged and the acceptance rate is
-reported. Measured acceptance is roughly 45% of scene attempts at `64^3`, at
-about 0.07 s per accepted scene, so the full corpus takes well under a minute.
-Grid escalation to `72^3` then `80^3` exists for packing failures and has not
-been needed at the configured sizes.
+rejected and regenerated whenever an object cannot be placed, an object does not
+fit inside the simulated head, a pair of centroids has no well-defined
+direction, or some target has no feasible three-direction anchor set; the reason
+is logged and the acceptance rate is reported. Measured acceptance is roughly
+30% of scene attempts at `64^3`, dominated by the anchor-triple rule — the head
+constraint costs about one point, measured with it off. Grid escalation to
+`72^3` then `80^3` exists for packing failures and has not been needed at the
+configured sizes.
+
+Each accepted scene is then given an MRI-like appearance
+([`mri_appearance.md`](mri_appearance.md)) and written as a NIfTI directory.
+That is what dominates the runtime: roughly 0.5 s per accepted scene, so the
+full corpus takes a few minutes and about 330 MB. The appearance draws from a
+random stream disjoint from the packer's, so layouts are unchanged by it and a
+corpus generated with `enabled: false` is directly comparable.
 
 ## Stage A (Phase 1)
 
-A promptable residual 3D U-Net: binary `scene_volume` in, one mask logit volume
+A promptable residual 3D U-Net: the scene image `scene_volume` in, one mask logit volume
 per requested shape name out. Architecture, training, loss, metrics and dataset
 are in `docs/flowchart/phase1_encoder_decoder.drawio` and
 `docs/stage_a_architecture.md`.

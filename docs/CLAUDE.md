@@ -18,9 +18,10 @@ The project must remain useful for a later MRI setting in which anchor masks are
 - Input/output resolution: default input and output are `64 x 64 x 64` voxels. The encoder may reduce the spatial resolution internally, but the final prediction must return to `64 x 64 x 64`.
 - Each synthetic scene contains exactly one instance of each of ten fixed shape classes.
 - Shapes must be fully contained and must not overlap.
-- Shapes use one foreground intensity on a zero background. No MRI appearance model is required in this milestone.
+- Scenes carry a simulated MRI-like image: partial-volume edges, per-structure intensities on a tissue background, texture, a receive-coil bias field and Rician noise from a k-space magnitude reconstruction. Structure intensities must be drawn independently of shape class, so appearance can never identify a structure — the target stays reachable only through the three relations. `configs/appearance.yaml` + `docs/mri_appearance.md`; `enabled: false` there restores the earlier binary volumes (one foreground intensity on a zero background) as a baseline.
+- The **labels** are not blurred. `instance_labels` and every mask derived from it stay crisp centre-in-solid masks, as a manual segmentation does over a real scan.
 - Shapes are axis-aligned in the first version. Do not introduce rotations until a later experiment.
-- The relational model receives three ordered anchor-mask channels, the prompt representation, geometry derived from those masks, and the binary scene occupancy. It must not receive instance labels, the target mask, the target class, the target centroid, or the target instance ID.
+- The relational model receives three ordered anchor-mask channels, the prompt representation, geometry derived from those masks, and the scene image. It must not receive instance labels, the target mask, the target class, the target centroid, or the target instance ID.
 - Anchor channels must remain separate. A union of the three anchor masks is allowed only for an ablation baseline, never as the main representation.
 - The three prompt directions must always be different.
 - All random operations must use explicit, saved seeds.
@@ -91,7 +92,7 @@ The vocabulary must be defined once in configuration and referenced by stable in
 
 ### Geometry
 
-Generate a binary scene on a `64 x 64 x 64` grid. Use simple analytic voxelizers for the ten primitives. Randomize shape centers and shape-specific dimensions within configured ranges, but do not randomize orientation in this milestone.
+Generate a scene on a `64 x 64 x 64` grid. Use simple analytic voxelizers for the ten primitives. Randomize shape centers and shape-specific dimensions within configured ranges, but do not randomize orientation in this milestone.
 
 Use an initial occupancy target of approximately 8–22% of each axis per object, with class-specific ranges adjusted so occupied volumes are broadly comparable. Enforce a configurable in-bounds margin.
 
@@ -104,7 +105,9 @@ Use rejection sampling:
 
 There is no required minimum separation beyond non-overlap. If packing repeatedly fails at `64^3`, regenerate the scene with new parameters first. Do not silently omit or duplicate an object. If a configurable maximum number of scene attempts is exhausted, increase all three dimensions together (for example `72^3`, then `80^3`) and record the actual `volume_shape`; the output/crop contract must still be explicit.
 
-Save both `scene_volume` (binary foreground/background) and `instance_labels` (zero background plus one distinct label for each shape).
+Save `image` (the simulated MRI-like volume), `scene_volume` (binary foreground/background) and `instance_labels` (zero background plus one distinct label for each shape). Scenes are written as NIfTI (`.nii.gz`) directories in a RAS frame, together with one binary mask per structure, the per-example target and ordered anchor channels, and a `scene.json` recording the seeds, the placed parameters and every appearance draw. See `docs/dataset_schema.md`.
+
+Structures must be placed inside the simulated head, not in the air around it.
 
 ### Prompt and anchor generation
 
@@ -178,13 +181,13 @@ The implementation has two distinct networks and two evaluation modes.
 
 ### Stage A: full-volume shape segmenter
 
-Train a multiclass 3D U-Net-style segmenter on the complete synthetic `scene_volume`. It predicts ten shape masks from the binary scene. This is the synthetic analogue of the future anatomy segmenter that will produce anchor masks from MRI.
+Train a multiclass 3D U-Net-style segmenter on the complete synthetic scene image. It predicts ten shape masks from that image. This is the synthetic analogue of the future anatomy segmenter that will produce anchor masks from MRI, which is why its input has to be an acquisition rather than a binary volume.
 
 Stage A must be evaluated independently with per-class Dice and IoU. Save its checkpoints and support inference that extracts the three requested anchor masks by shape name.
 
 ### Stage B: relational target segmenter
 
-Stage B receives exactly three ordered binary anchor-mask channels, the structured three-clause prompt (or equivalent closed-vocabulary embedding), geometry features derived from those masks, and the binary scene occupancy. Occupancy is a decoder-side WHAT stream: the encoder never sees it. Still forbidden: instance labels, target mask, target class, target centroid, target instance id.
+Stage B receives exactly three ordered binary anchor-mask channels, the structured three-clause prompt (or equivalent closed-vocabulary embedding), geometry features derived from those masks, and the scene image. The image is a decoder-side WHAT stream: the encoder never sees it. Still forbidden: instance labels, target mask, target class, target centroid, target instance id.
 
 Use a 3D encoder-decoder with skip connections:
 
@@ -317,10 +320,13 @@ src/
   data/
     primitives.py
     voxelization.py
+    appearance.py
     scene_generator.py
     direction_rules.py
     prompt_generator.py
     schema.py
+    nifti_io.py
+    scene_io.py
     validation.py
   models/
     shape_segmenter.py
@@ -347,6 +353,7 @@ scripts/
   train_relational_model.py
   evaluate.py
   run_smoke_test.py
+  preview_scene.py
 tests/
   test_primitives.py
   test_directions.py
@@ -356,6 +363,7 @@ tests/
   test_augmentations.py
 docs/
   dataset_schema.md
+  mri_appearance.md
   experiment_protocol.md
 ```
 

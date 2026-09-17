@@ -17,7 +17,9 @@ explicit - the model predicts at the recorded ``volume_shape``.
 
 All randomness derives from the scene seed: attempt ``a`` at escalation stage
 ``s`` uses ``default_rng([seed, s, a])``, so a scene is bit-for-bit
-reproducible from its seed alone.
+reproducible from its seed alone. The MRI-like appearance
+(:mod:`src.data.appearance`) is drawn from a disjoint stream keyed on the same
+seed, so it never shifts when packing needs one more attempt.
 """
 
 from __future__ import annotations
@@ -28,7 +30,15 @@ from typing import Any, Iterator, Mapping, Sequence
 import numpy as np
 
 from src.config import load_config
+from src.data.appearance import (
+    AppearanceSettings,
+    BodyGeometry,
+    SceneAppearance,
+    draw_body,
+    simulate_scene_appearance,
+)
 from src.data.direction_rules import (
+    DIRECTION_RULE_VERSION,
     AmbiguousDirectionError,
     bbox_extent_world,
     centroid_world,
@@ -46,6 +56,7 @@ from src.data.validation import (
     RejectionReason,
     ValidationError,
     check_in_bounds,
+    check_inside_body,
     check_no_overlap,
     validate_example,
     validate_instance_labels,
@@ -81,9 +92,14 @@ class GeneratorSettings:
     shapes_per_scene: int
     reference_axis_length: int
     generator_version: str
+    appearance: AppearanceSettings
 
     @classmethod
-    def from_config(cls, config: Mapping[str, Any] | None = None) -> "GeneratorSettings":
+    def from_config(
+        cls,
+        config: Mapping[str, Any] | None = None,
+        appearance: AppearanceSettings | None = None,
+    ) -> "GeneratorSettings":
         config = dict(config or load_config("generator"))
         geometry = config["geometry"]
         packing = config["packing"]
@@ -102,6 +118,7 @@ class GeneratorSettings:
             shapes_per_scene=int(packing["shapes_per_scene"]),
             reference_axis_length=int(SHAPE_VOCABULARY.reference_axis_length),
             generator_version=str(config["generator_version"]),
+            appearance=appearance or AppearanceSettings.from_config(),
         )
 
     def replace_volume_shape(self, volume_shape: Sequence[int]) -> "GeneratorSettings":
@@ -117,6 +134,7 @@ class GeneratorSettings:
             shapes_per_scene=self.shapes_per_scene,
             reference_axis_length=self.reference_axis_length,
             generator_version=self.generator_version,
+            appearance=self.appearance,
         )
 
     @property
@@ -138,6 +156,17 @@ class GeneratedScene:
     examples: list[Example]
     attempts: int
     shape_params: dict[str, dict[str, float]] = field(default_factory=dict)
+    shape_centers: dict[str, tuple[float, float, float]] = field(default_factory=dict)
+    stage: int = 0
+    body: BodyGeometry | None = None
+    #: The simulated MRI-like volume and everything that produced it, or
+    #: ``None`` when the appearance model is disabled.
+    appearance: SceneAppearance | None = None
+
+    @property
+    def image(self) -> np.ndarray:
+        """The volume a model is fed: the simulated image, else the occupancy."""
+        return self.scene_volume if self.appearance is None else self.appearance.image
 
 
 # ---------------------------------------------------------------------------
@@ -204,10 +233,17 @@ def pack_scene(
     settings: GeneratorSettings,
     scale: float,
     log: RejectionLog | None = None,
-) -> tuple[np.ndarray, dict[str, dict[str, float]]]:
+    body: BodyGeometry | None = None,
+) -> tuple[np.ndarray, dict[str, dict[str, float]], dict[str, tuple[float, float, float]]]:
     """Place all ten objects by rejection sampling.
 
-    Returns ``(instance_labels, shape_params)``.
+    Returns ``(instance_labels, shape_params, shape_centers)``. The centres are
+    kept because the appearance model needs the continuous solid, not just the
+    voxelised one, to compute partial-volume fractions.
+
+    ``body`` is the simulated head. When it is given, an object must fit inside
+    it as well as inside the grid margin: structures belong in tissue, not in
+    the air around the head.
 
     Raises:
         ValidationError: packing failed within the per-object attempt budget.
@@ -215,6 +251,7 @@ def pack_scene(
     labels = np.zeros(settings.volume_shape, dtype=np.uint8)
     occupancy = np.zeros(settings.volume_shape, dtype=bool)
     shape_params: dict[str, dict[str, float]] = {}
+    shape_centers: dict[str, tuple[float, float, float]] = {}
 
     for spec in placement_order():
         placed = False
@@ -224,6 +261,12 @@ def pack_scene(
             center = sample_center(rng, half_extent, settings)
             if center is None:
                 continue  # too big for this grid: draw a smaller one
+            try:
+                check_inside_body(center, half_extent, body)
+            except ValidationError as error:
+                if log is not None:
+                    log.reject_object(error.reason)
+                continue
             try:
                 candidate = voxelize(spec.name, params, center, settings.volume_shape, settings.spacing)
             except VoxelizationError:  # pragma: no cover - guarded by sample_shape_params
@@ -242,6 +285,7 @@ def pack_scene(
             labels[candidate] = spec.id
             occupancy |= candidate
             shape_params[spec.name] = params
+            shape_centers[spec.name] = tuple(float(v) for v in center)  # type: ignore[assignment]
             placed = True
             break
         if not placed:
@@ -251,7 +295,7 @@ def pack_scene(
             )
 
     validate_instance_labels(labels, margin_voxels=settings.margin_voxels)
-    return labels, shape_params
+    return labels, shape_params, shape_centers
 
 
 # ---------------------------------------------------------------------------
@@ -351,6 +395,7 @@ def generate_scene(
     scene_id = scene_id or f"scene_{seed:09d}"
     attempts = 0
 
+    appearance_settings = base.appearance
     for stage, volume_shape in enumerate(base.stage_volume_shapes):
         stage_settings = base.replace_volume_shape(volume_shape)
         scale = (
@@ -358,11 +403,19 @@ def generate_scene(
             if base.rescale_on_escalation
             else 1.0
         )
+        # Drawn before packing, from its own stream, so the head outline of a
+        # scene does not depend on how many placement retries it needed.
+        body = draw_body(
+            seed, stage, appearance_settings, volume_shape, stage_settings.spacing
+        )
+        placement_body = body if appearance_settings.constrain_placement else None
         for attempt in range(base.max_scene_attempts):
             attempts += 1
             rng = np.random.default_rng([seed, stage, attempt])
             try:
-                labels, shape_params = pack_scene(rng, stage_settings, scale, log=log)
+                labels, shape_params, shape_centers = pack_scene(
+                    rng, stage_settings, scale, log=log, body=placement_body
+                )
                 examples = build_examples(
                     scene_id, seed, labels, stage_settings, split=split
                 )
@@ -379,6 +432,20 @@ def generate_scene(
                     log.reject(RejectionReason.NO_FEASIBLE_ANCHOR_TRIPLE)
                 continue
 
+            appearance = None
+            if appearance_settings.enabled:
+                appearance = simulate_scene_appearance(
+                    seed,
+                    stage,
+                    instance_labels=labels,
+                    shape_params=shape_params,
+                    shape_centers=shape_centers,
+                    body=body,
+                    settings=appearance_settings,
+                    volume_shape=stage_settings.volume_shape,
+                    spacing=stage_settings.spacing,
+                )
+
             if log is not None:
                 log.accept()
             return GeneratedScene(
@@ -391,6 +458,10 @@ def generate_scene(
                 examples=examples,
                 attempts=attempts,
                 shape_params=shape_params,
+                shape_centers=shape_centers,
+                stage=stage,
+                body=body,
+                appearance=appearance,
             )
 
     raise SceneGenerationError(
@@ -438,3 +509,88 @@ def scene_occupancy_report(scene: GeneratedScene) -> dict[str, Any]:
         (scene.instance_labels != 0).sum() / scene.instance_labels.size
     )
     return report
+
+
+def scene_record(scene: GeneratedScene, *, split: str | None = None) -> dict[str, Any]:
+    """The JSON record written next to a scene's volumes as ``scene.json``.
+
+    Self-contained on purpose: it names the array order and the world frame, it
+    carries the affine the NIfTI files were written with, it lists the analytic
+    parameters and the measured geometry of every structure, and it records
+    every appearance draw. Reading it should be enough to understand a scene
+    without importing this package.
+    """
+    from src.data.nifti_io import scene_affine
+    from src.data.primitives import VOCABULARY_VERSION
+    from src.data.schema import SCHEMA_VERSION
+
+    labels = scene.instance_labels
+    image = scene.appearance.image if scene.appearance is not None else None
+    intensities = (
+        scene.appearance.parameters["structure_intensities"]
+        if scene.appearance is not None
+        else {}
+    )
+
+    structures: dict[str, Any] = {}
+    for spec in SHAPE_VOCABULARY:
+        mask = labels == spec.id
+        params = scene.shape_params.get(spec.name, {})
+        entry: dict[str, Any] = {
+            "instance_id": spec.id,
+            "family": spec.family,
+            "params_world": {name: float(value) for name, value in params.items()},
+            "center_world": [float(v) for v in scene.shape_centers.get(spec.name, ())],
+            "centroid_world": [float(v) for v in centroid_world(mask, scene.spacing)],
+            "bbox_extent_world": [float(v) for v in bbox_extent_world(mask, scene.spacing)],
+            "voxels": int(mask.sum()),
+            "analytic_volume_world": (
+                float(analytic_volume_world(spec.name, params)) if params else None
+            ),
+            "mean_intensity": (
+                float(np.asarray(image)[mask].mean()) if image is not None and mask.any() else None
+            ),
+            "assigned_intensity": intensities.get(spec.name),
+        }
+        structures[spec.name] = entry
+
+    return {
+        "scene_id": scene.scene_id,
+        "seed": int(scene.seed),
+        "split": split,
+        "escalation_stage": int(scene.stage),
+        "packing_attempts": int(scene.attempts),
+        "volume_shape_zyx": list(scene.volume_shape),
+        "spacing_xyz": list(scene.spacing),
+        "array_order": "(z, y, x)",
+        "world_frame": "RAS, ordered (x, y, z); x lateral, y anterior, z superior",
+        "affine": [[float(v) for v in row] for row in scene_affine(scene.spacing)],
+        "versions": {
+            "generator_version": scene.examples[0].metadata.generator_version
+            if scene.examples
+            else None,
+            "direction_rule_version": DIRECTION_RULE_VERSION,
+            "vocabulary_version": VOCABULARY_VERSION,
+            "schema_version": SCHEMA_VERSION,
+            "appearance_version": (
+                scene.appearance.parameters["appearance_version"]
+                if scene.appearance is not None
+                else None
+            ),
+        },
+        "foreground_fraction": float((labels != 0).sum() / labels.size),
+        "structures": structures,
+        "appearance": None if scene.appearance is None else scene.appearance.parameters,
+        "examples": [
+            {
+                "example_id": example.metadata.example_id,
+                "target_instance_id": example.metadata.target_instance_id,
+                "target_shape_name": example.metadata.target_shape_name,
+                "anchor_instance_ids": list(example.metadata.anchor_instance_ids),
+                "anchor_shape_names": list(example.metadata.anchor_shape_names),
+                "relations": example.metadata.relations,
+                "prompt": example.metadata.prompt,
+            }
+            for example in scene.examples
+        ],
+    }

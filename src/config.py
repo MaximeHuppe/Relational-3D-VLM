@@ -16,7 +16,7 @@ import yaml
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CONFIG_DIR = PROJECT_ROOT / "configs"
 
-CONFIG_NAMES = ("shapes", "generator", "split", "model", "train")
+CONFIG_NAMES = ("shapes", "generator", "appearance", "split", "model", "train")
 
 
 def config_path(name: str) -> Path:

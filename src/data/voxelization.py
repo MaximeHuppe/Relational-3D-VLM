@@ -280,3 +280,119 @@ def voxelize(
     z, y, x = world_coordinate_grids(volume_shape, spacing)
     mask = _VOXELIZERS[shape_name](x - center[0], y - center[1], z - center[2], checked)
     return np.broadcast_to(mask, tuple(int(v) for v in volume_shape)).copy()
+
+
+# ---------------------------------------------------------------------------
+# Partial volume: the same solids, sampled below the voxel grid
+# ---------------------------------------------------------------------------
+#: Default sub-samples per voxel edge. ``s`` costs ``s**3`` evaluations per
+#: voxel and quantises a boundary fraction to ``1 / s**3``.
+DEFAULT_SUBDIVISIONS = 4
+
+
+def _axis_samples(
+    low: int, high: int, spacing: float, subdivisions: int
+) -> tuple[np.ndarray, int]:
+    """World coordinates of the sub-voxel sample centres on one axis.
+
+    Voxel ``i`` is subdivided into ``subdivisions`` equal cells; the samples are
+    their centres, so ``subdivisions == 1`` reproduces the voxel centre and
+    therefore :func:`voxelize` exactly.
+    """
+    indices = np.arange(low, high + 1, dtype=np.float64)
+    offsets = (np.arange(subdivisions, dtype=np.float64) + 0.5) / subdivisions - 0.5
+    return ((indices[:, None] + offsets[None, :]) * spacing).ravel(), indices.size
+
+
+def supersampled_fraction(
+    indicator: Callable[[np.ndarray, np.ndarray, np.ndarray], np.ndarray],
+    volume_shape: Sequence[int],
+    spacing: Sequence[float] = (1.0, 1.0, 1.0),
+    *,
+    bounds_world: Sequence[Sequence[float]] | None = None,
+    subdivisions: int = DEFAULT_SUBDIVISIONS,
+) -> np.ndarray:
+    """Per-voxel occupied fraction of an arbitrary solid, in ``[0, 1]``.
+
+    Args:
+        indicator: called with broadcastable world coordinate arrays ``(x, y, z)``
+            and returns a boolean array that is ``True`` inside the solid.
+        volume_shape: ``(D, H, W)``.
+        spacing: world units per voxel, ordered ``(x, y, z)``.
+        bounds_world: optional ``((x_lo, x_hi), (y_lo, y_hi), (z_lo, z_hi))``
+            world bounding box of the solid. Sampling is restricted to the
+            voxels it touches (plus one voxel of slack), which is what keeps
+            this cheap; outside it the fraction is exactly 0.
+        subdivisions: sub-samples per voxel edge.
+
+    Returns:
+        ``(D, H, W)`` float32 indexed ``(z, y, x)``.
+    """
+    if int(subdivisions) < 1:
+        raise VoxelizationError(f"subdivisions must be >= 1, got {subdivisions}")
+    subdivisions = int(subdivisions)
+    shape = tuple(int(v) for v in volume_shape)
+    depth, height, width = shape
+    sizes = (width, height, depth)  # world-axis order (x, y, z)
+    out = np.zeros(shape, dtype=np.float32)
+
+    windows: list[tuple[int, int]] = []
+    for axis, (size, step) in enumerate(zip(sizes, (float(v) for v in spacing))):
+        if bounds_world is None:
+            low, high = 0, size - 1
+        else:
+            lo_world, hi_world = (float(v) for v in bounds_world[axis])
+            low = max(int(np.floor(lo_world / step)) - 1, 0)
+            high = min(int(np.ceil(hi_world / step)) + 1, size - 1)
+            if low > high:
+                return out  # the solid misses the grid entirely
+        windows.append((low, high))
+
+    (x_lo, x_hi), (y_lo, y_hi), (z_lo, z_hi) = windows
+    sx, sy, sz = (float(v) for v in spacing)
+    xs, nx = _axis_samples(x_lo, x_hi, sx, subdivisions)
+    ys, ny = _axis_samples(y_lo, y_hi, sy, subdivisions)
+    zs, nz = _axis_samples(z_lo, z_hi, sz, subdivisions)
+
+    inside = indicator(xs[None, None, :], ys[None, :, None], zs[:, None, None])
+    inside = np.broadcast_to(inside, (zs.size, ys.size, xs.size))
+    fractions = inside.reshape(
+        nz, subdivisions, ny, subdivisions, nx, subdivisions
+    ).mean(axis=(1, 3, 5), dtype=np.float64)
+    out[z_lo : z_hi + 1, y_lo : y_hi + 1, x_lo : x_hi + 1] = fractions.astype(np.float32)
+    return out
+
+
+def partial_volume(
+    shape_name: str,
+    params: Mapping[str, float],
+    center_world: Sequence[float],
+    volume_shape: Sequence[int],
+    spacing: Sequence[float] = (1.0, 1.0, 1.0),
+    *,
+    subdivisions: int = DEFAULT_SUBDIVISIONS,
+) -> np.ndarray:
+    """Partial-volume fractions of one primitive, same arguments as :func:`voxelize`.
+
+    ``voxelize`` answers "is this voxel's centre inside the solid" and is what
+    the label volume is made of; this answers "how much of this voxel is inside
+    the solid" and is what the *image* is made of. The two agree in the interior
+    and differ by design on the boundary, which is exactly the partial-volume
+    effect the label of a real acquisition also hides.
+    """
+    checked = check_params(shape_name, params)
+    center = np.asarray(center_world, dtype=np.float64)
+    if center.shape != (3,):
+        raise VoxelizationError(f"center_world must be (x, y, z), got {center.shape}")
+    half = half_extent_world(shape_name, checked)
+    bounds = tuple(
+        (float(center[axis] - half[axis]), float(center[axis] + half[axis])) for axis in range(3)
+    )
+    solid = _VOXELIZERS[shape_name]
+
+    def indicator(x: np.ndarray, y: np.ndarray, z: np.ndarray) -> np.ndarray:
+        return solid(x - center[0], y - center[1], z - center[2], checked)
+
+    return supersampled_fraction(
+        indicator, volume_shape, spacing, bounds_world=bounds, subdivisions=subdivisions
+    )

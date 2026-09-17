@@ -2,6 +2,9 @@
 numpy>=1.26
 pyyaml>=6.0
 pytest>=8.0
+# Scenes are written as .nii.gz; nibabel is required to generate or read a
+# corpus. Set storage.scene_array_format to npz_compressed to do without it.
+nibabel>=5.2
 
 # Phase 1 onwards (models, training, evaluation).
 # On Apple Silicon the default wheel ships MPS support; on the RTX 5090 install

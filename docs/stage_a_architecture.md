@@ -1,7 +1,8 @@
 # Stage A architecture
 
 Phase 1 of the training procedure: a full-volume **promptable** shape segmenter.
-It takes the binary `scene_volume` and a set of shape names, and returns one mask
+It takes the scene image `scene_volume` — the simulated MRI-like volume, see
+[`mri_appearance.md`](mri_appearance.md) — and a set of shape names, and returns one mask
 logit volume per requested name. It is the synthetic analogue of the MRI anatomy
 segmenter that will later supply anchor masks, and it is what Phase 4 calls to
 extract the three anchors a prompt names.

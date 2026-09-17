@@ -201,9 +201,13 @@ def test_anisotropic_classes_never_degenerate_into_their_isotropic_twin():
 
 def test_packing_places_exactly_ten_non_overlapping_in_bounds_objects(settings):
     rng = np.random.default_rng([42, 0, 0])
-    labels, params = pack_scene(rng, settings, 1.0)
+    labels, params, centers = pack_scene(rng, settings, 1.0)
     assert np.array_equal(np.unique(labels), np.arange(0, 11))
     assert set(params) == set(SHAPE_VOCABULARY.names)
+    # The centres are what the appearance model needs to recover the continuous
+    # solid, so every placed shape must report one.
+    assert set(centers) == set(SHAPE_VOCABULARY.names)
+    assert all(len(center) == 3 for center in centers.values())
     margin = settings.margin_voxels
     for axis in range(3):
         occupied = np.nonzero((labels != 0).any(axis=tuple(i for i in range(3) if i != axis)))[0]
@@ -216,9 +220,10 @@ def test_packing_places_exactly_ten_non_overlapping_in_bounds_objects(settings):
 
 
 def test_a_scene_is_reproducible_from_its_seed(settings):
-    first, _ = pack_scene(np.random.default_rng([7, 0, 0]), settings, 1.0)
-    second, _ = pack_scene(np.random.default_rng([7, 0, 0]), settings, 1.0)
+    first, _, first_centers = pack_scene(np.random.default_rng([7, 0, 0]), settings, 1.0)
+    second, _, second_centers = pack_scene(np.random.default_rng([7, 0, 0]), settings, 1.0)
     assert np.array_equal(first, second)
+    assert first_centers == second_centers
 
 
 def test_escalation_grids_are_configured_and_rescale_sizes(settings):
@@ -282,7 +287,7 @@ def test_generate_examples_filters_by_target_class(settings):
 
 def test_build_examples_raises_when_a_target_has_no_feasible_triple(settings):
     """A raw packing may be infeasible; that raise is what rejects the scene."""
-    labels, _ = pack_scene(np.random.default_rng([42, 0, 0]), settings, 1.0)
+    labels, _, _ = pack_scene(np.random.default_rng([42, 0, 0]), settings, 1.0)
     with pytest.raises(AnchorSelectionError):
         build_examples("scene_test", 42, labels, settings, split="train")
 

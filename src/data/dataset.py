@@ -1,6 +1,6 @@
 """PyTorch datasets over a generated corpus.
 
-Stage A consumes *scenes*: one sample is a whole ``scene_volume`` plus the ten
+Stage A consumes *scenes*: one sample is a whole scene image plus the ten
 per-shape masks derived from ``instance_labels``. The target-class split filter
 does not apply to Stage A - it constrains which target classes Stage B may be
 supervised on, while Stage A must learn all ten shapes in every split - so
@@ -8,8 +8,8 @@ supervised on, while Stage A must learn all ten shapes in every split - so
 that split's manifest.
 
 Stage B consumes *examples*: one sample is one ``(scene, target)`` pair - three
-ordered anchor channels, a three-clause prompt, the binary scene occupancy, and
-the target mask that supervises it - read from the same manifests.
+ordered anchor channels, a three-clause prompt, the scene image, and the target
+mask that supervises it - read from the same manifests.
 :class:`ExampleDataset` is filtered by ``configs/split.yaml`` at generation time,
 so it yields only the target classes a split is allowed to supervise.
 
@@ -22,6 +22,17 @@ clause triple is re-derived for that pose - see that module for why the
 directions cannot be relabelled token-by-token. Augmentation is opt-in per
 dataset, so it is attached to the training split and never to validation or
 test, and the corpus on disk is never modified.
+
+The scene image
+---------------
+Both datasets hand the model a ``scene_volume`` tensor. On a corpus generated
+with ``configs/appearance.yaml`` enabled that is the simulated MRI-like volume,
+normalised per volume by :class:`ImagePolicy`; on an older corpus it is the
+binary occupancy, and ``image_source="occupancy"`` forces the binary form on
+either. The key stays ``scene_volume`` because that is what the models call
+their image argument; nothing about the label contract changes with it, and the
+schema's own ``scene_volume`` - the thing validation compares against
+``instance_labels`` - remains the binary occupancy.
 """
 
 from __future__ import annotations
@@ -34,9 +45,11 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 
+from src.data.appearance import AppearanceSettings, normalize_image
 from src.data.primitives import SHAPE_NAMES, SHAPE_VOCABULARY
 from src.data.prompt_generator import clause_indices
-from src.data.schema import ExampleArrays, ExampleMetadata, load_scene_arrays, read_manifest
+from src.data.scene_io import SceneIOError, SceneVolumes, load_scene, scene_path
+from src.data.schema import ExampleArrays, ExampleMetadata, read_manifest
 
 if TYPE_CHECKING:  # pragma: no cover - `src.data` must not import `src.training`
     from src.training.augmentations import RotationAugmentation
@@ -44,6 +57,65 @@ if TYPE_CHECKING:  # pragma: no cover - `src.data` must not import `src.training
 
 class DatasetError(RuntimeError):
     """Raised when a corpus on disk cannot back the requested dataset."""
+
+
+#: How a dataset picks the volume it hands the model as ``scene_volume``.
+#: ``auto`` is the simulated MRI-like image when the corpus has one and the
+#: binary occupancy when it does not, so a corpus from either milestone loads
+#: without a flag.
+IMAGE_SOURCES: tuple[str, ...] = ("auto", "intensity", "occupancy")
+
+#: In-memory type of a cached scene image. float16 halves the cache against
+#: float32, and its ~5e-4 quantisation over the normalised range is well under
+#: the image's own noise, so nothing a model sees changes. Items are cast back
+#: to float32 on the way out.
+CACHE_DTYPE = np.float16
+
+
+@dataclass(frozen=True)
+class ImagePolicy:
+    """Which volume a dataset feeds the model, and how it is normalised.
+
+    The binary volumes of the previous milestone needed no normalisation - they
+    were already 0/1. A simulated acquisition does: its units are arbitrary and
+    its bias field shifts the level across the volume, exactly as a real one's
+    does, so every volume is normalised on its own at load time rather than
+    baked into the corpus. The transform depends only on the volume's own
+    intensities, so it commutes with the rotation augmentation.
+    """
+
+    source: str = "auto"
+    mode: str = "percentile"
+    percentiles: tuple[float, float] = (0.5, 99.5)
+    clip: tuple[float, float] | None = (-0.5, 1.5)
+
+    def __post_init__(self) -> None:
+        if self.source not in IMAGE_SOURCES:
+            raise DatasetError(
+                f"image_source must be one of {IMAGE_SOURCES}, got {self.source!r}"
+            )
+
+    @classmethod
+    def from_config(cls, source: str = "auto") -> "ImagePolicy":
+        settings = AppearanceSettings.from_config()
+        return cls(
+            source=source,
+            mode=settings.normalization_mode,
+            percentiles=settings.normalization_percentiles,
+            clip=settings.normalization_clip,
+        )
+
+    def apply(self, volumes: SceneVolumes) -> np.ndarray:
+        """The model-facing volume of one scene, normalised when it is an image."""
+        image = volumes.model_image(self.source)
+        if self.source == "occupancy" or (self.source == "auto" and not volumes.has_image):
+            return np.asarray(image, dtype=np.float32)
+        return normalize_image(
+            image, mode=self.mode, percentiles=self.percentiles, clip=self.clip
+        )
+
+    def describe(self) -> str:
+        return f"image={self.source}/{self.mode}"
 
 
 @dataclass(frozen=True)
@@ -71,9 +143,10 @@ def scene_records(root: Path | str, split: str) -> list[SceneRecord]:
     for metadata in read_manifest(manifest):
         if metadata.scene_id in records:
             continue
-        path = root / "scenes" / f"{metadata.scene_id}.npz"
-        if not path.is_file():
-            raise DatasetError(f"missing scene arrays {path}")
+        try:
+            path = scene_path(root, metadata.scene_id)
+        except SceneIOError as error:
+            raise DatasetError(str(error)) from error
         records[metadata.scene_id] = SceneRecord(
             scene_id=metadata.scene_id,
             path=path,
@@ -87,11 +160,13 @@ def scene_records(root: Path | str, split: str) -> list[SceneRecord]:
 
 
 class SceneDataset(Dataset):
-    """Stage A samples: ``scene_volume`` in, one binary mask per shape name out.
+    """Stage A samples: the scene image in, one binary mask per shape name out.
 
     Each item is a dict with:
 
-    ``scene_volume``  ``[1, D, H, W]`` float32, the binary scene;
+    ``scene_volume``  ``[1, D, H, W]`` float32, the scene image - the simulated
+                      MRI-like volume when the corpus has one, normalised per
+                      volume, otherwise the binary occupancy;
     ``prompt_ids``    ``[N_T]`` int64, zero-based vocabulary indices;
     ``target_masks``  ``[N_T, D, H, W]`` float32, aligned with ``prompt_ids``;
     ``instance_labels`` ``[D, H, W]`` int64, kept for qualitative output;
@@ -103,12 +178,18 @@ class SceneDataset(Dataset):
         prompt_names: which shape names to request, in order. Defaults to the
             full vocabulary in canonical order.
         limit: keep only the first N scenes (smoke runs).
+        image_source: which stored volume backs ``scene_volume`` - ``auto``
+            (the simulated image when the corpus has one), ``intensity`` or
+            ``occupancy``. ``occupancy`` reproduces the binary input of the
+            previous milestone and is the baseline to compare against.
         cache: hold the scenes in memory to keep I/O out of the training loop.
-            Only the two compact uint8 volumes are cached (~0.52 MB per scene);
-            the float tensors and the per-shape masks are derived per item.
-            Caching the derived tensors instead would cost ~13.6 MB per scene -
-            5.4 GB for a 400-scene split, multiplied again by every persistent
-            dataloader worker.
+            Only the normalised image (float16) and the uint8 label volume are
+            cached, ~0.79 MB per scene; the per-shape masks are derived per
+            item. Caching the derived masks instead would cost ~13.6 MB per
+            scene - 5.4 GB for a 400-scene split, multiplied again by every
+            persistent dataloader worker. float16 halves the image against
+            float32 and its ~5e-4 quantisation is under 2% of the image noise,
+            so it changes nothing a model can see.
         augment: rotate each scene into a per-epoch pose. Stage A has no
             relations to rewrite - the scene and all ten masks rotate together,
             and a rotated cube is still a cube - so the labels stay correct by
@@ -128,10 +209,12 @@ class SceneDataset(Dataset):
         prompt_names: Sequence[str] | None = None,
         limit: int | None = None,
         cache: bool = True,
+        image_source: str = "auto",
         augment: "RotationAugmentation | None" = None,
     ) -> None:
         self.root = Path(root)
         self.split = split
+        self.image_policy = ImagePolicy.from_config(image_source)
         self.records = scene_records(self.root, split)
         if limit is not None:
             self.records = self.records[: max(int(limit), 0)]
@@ -168,13 +251,20 @@ class SceneDataset(Dataset):
             self.augment.set_epoch(epoch)
 
     def _volumes(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """The two compact uint8 volumes of a scene, cached as stored on disk."""
+        """A scene's model-facing image and its label volume, cached as loaded.
+
+        Normalisation is done here, once per scene, rather than per item: it
+        depends only on the stored volume, so caching the normalised result is
+        equivalent to caching the raw one and cheaper per epoch.
+        """
         if self._cache is not None and index in self._cache:
             return self._cache[index]
-        scene_volume, instance_labels = load_scene_arrays(self.records[index].path)
+        scene = load_scene(self.records[index].path)
         volumes = (
-            torch.from_numpy(np.ascontiguousarray(scene_volume, dtype=np.uint8)),
-            torch.from_numpy(np.ascontiguousarray(instance_labels, dtype=np.uint8)),
+            torch.from_numpy(
+                np.ascontiguousarray(self.image_policy.apply(scene), dtype=CACHE_DTYPE)
+            ),
+            torch.from_numpy(np.ascontiguousarray(scene.instance_labels, dtype=np.uint8)),
         )
         if self._cache is not None:
             self._cache[index] = volumes
@@ -214,7 +304,7 @@ class SceneDataset(Dataset):
         augment = "" if self.augment is None else f", {self.augment.describe()}"
         return (
             f"{self.split}: {len(self)} scenes at {self.volume_shape}, "
-            f"{len(self.prompt_names)} prompts{augment}"
+            f"{len(self.prompt_names)} prompts, {self.image_policy.describe()}{augment}"
         )
 
 
@@ -291,9 +381,10 @@ def example_records(
             continue
         if wanted_targets is not None and metadata.target_shape_name not in wanted_targets:
             continue
-        path = root / "scenes" / f"{metadata.scene_id}.npz"
-        if not path.is_file():
-            raise DatasetError(f"missing scene arrays {path}")
+        try:
+            path = scene_path(root, metadata.scene_id)
+        except SceneIOError as error:
+            raise DatasetError(str(error)) from error
         records.append(ExampleRecord(metadata=metadata, path=path))
     if not records:
         raise DatasetError(
@@ -313,10 +404,18 @@ class ExampleDataset(Dataset):
     ``anchor_shape_ids``   ``[3]`` int64, zero-based shape indices - these double
                            as Stage A's ``prompt_ids`` when anchors are predicted;
     ``anchor_union_mask``  ``[1, D, H, W]`` float32, ablation baseline only;
-    ``scene_volume``       ``[1, D, H, W]`` float32, binary occupancy of the
-                           whole scene. Always present by default. Stage A
+    ``scene_occupancy``    ``[1, D, H, W]`` float32, the binary foreground of the
+                           scene. Analysis only - it is what the occupancy
+                           sanity checks count connected components on, which
+                           cannot be done on the intensity image. Never an input;
+    ``scene_volume``       ``[1, D, H, W]`` float32, the scene image - the
+                           simulated MRI-like volume when the corpus has one,
+                           normalised per volume, otherwise the binary
+                           occupancy. Always present by default. Stage A
                            consumes it to predict anchors; Stage B's decoder
-                           consumes the same tensor as the WHAT stream.
+                           consumes the same tensor as the WHAT stream. It is
+                           the only appearance the model sees, and it still
+                           says nothing about which structure is the target.
     plus ``example_id``, ``scene_id``, ``prompt``, ``target_shape_name``,
     ``anchor_shape_names``, ``directions`` and ``rotation`` for reporting and
     stratification.
@@ -333,13 +432,17 @@ class ExampleDataset(Dataset):
         scene_ids: restrict to these scenes (Phase 2 overfits on one).
         target_shapes: restrict to these target classes; the manifest is already
             filtered by ``configs/split.yaml``, so this is a further narrowing.
-        include_scene_volume: return the binary scene occupancy. On by default
-            because Stage B's decoder needs it; predicted-anchor runs also
-            feed the same tensor to Stage A.
+        include_scene_volume: return the scene image. On by default because
+            Stage B's decoder needs it; predicted-anchor runs also feed the
+            same tensor to Stage A.
+        image_source: which stored volume backs ``scene_volume`` - ``auto``
+            (the simulated image when the corpus has one), ``intensity`` or
+            ``occupancy``. ``occupancy`` reproduces the binary WHAT stream of
+            the previous milestone.
         validate: re-run the full schema validation on the first visit to each
             scene. Cheap (once per scene) and fails fast on a corrupt corpus.
-        cache: hold decoded ``instance_labels`` in memory, one copy per scene
-            shared by that scene's examples.
+        cache: hold the normalised image (float16) and ``instance_labels`` in
+            memory, one copy per scene shared by that scene's ten examples.
         augment: rotate each example into a per-epoch pose and re-derive its
             three directions for that pose. The anchors, their order and the
             target are untouched; ``direction_ids``, ``prompt`` and
@@ -361,10 +464,12 @@ class ExampleDataset(Dataset):
         include_scene_volume: bool = True,
         validate: bool = True,
         cache: bool = True,
+        image_source: str = "auto",
         augment: "RotationAugmentation | None" = None,
     ) -> None:
         self.root = Path(root)
         self.split = split
+        self.image_policy = ImagePolicy.from_config(image_source)
         self.records = example_records(
             self.root, split, scene_ids=scene_ids, target_shapes=target_shapes
         )
@@ -415,9 +520,19 @@ class ExampleDataset(Dataset):
         return list(seen)
 
     def _scene_arrays(self, record: ExampleRecord) -> tuple[np.ndarray, np.ndarray]:
+        """``(model image, instance labels)`` of a scene, cached per scene.
+
+        One copy is shared by that scene's ten examples; the schema
+        re-validation below reads the labels, which is where the binary
+        occupancy is re-derived from.
+        """
         if self._scene_cache is not None and record.scene_id in self._scene_cache:
             return self._scene_cache[record.scene_id]
-        arrays = load_scene_arrays(record.path)
+        scene = load_scene(record.path)
+        arrays = (
+            np.ascontiguousarray(self.image_policy.apply(scene), dtype=CACHE_DTYPE),
+            np.asarray(scene.instance_labels),
+        )
         if self._scene_cache is not None:
             self._scene_cache[record.scene_id] = arrays
         return arrays
@@ -430,8 +545,13 @@ class ExampleDataset(Dataset):
         if self.validate and metadata.example_id not in self._validated:
             # Full schema re-validation on first visit: exactly ten instances,
             # every channel equal to its declared anchor, the target absent from
-            # all three. Later epochs take the fast path below.
-            ExampleArrays.from_scene(metadata, scene_volume, instance_labels)
+            # all three. The schema's `scene_volume` is the binary occupancy, so
+            # it is re-derived from the labels here - the simulated image is the
+            # model's input, never the thing the label contract is checked
+            # against. Later epochs take the fast path below.
+            ExampleArrays.from_scene(
+                metadata, (np.asarray(instance_labels) != 0).astype(np.uint8), instance_labels
+            )
             self._validated.add(metadata.example_id)
 
         labels = np.asarray(instance_labels)
@@ -456,6 +576,12 @@ class ExampleDataset(Dataset):
             [(labels == instance_id) for instance_id in metadata.anchor_instance_ids]
         ).astype(np.float32)
         target_mask = (labels == metadata.target_instance_id).astype(np.float32)
+        # The binary foreground, for analysis only. The occupancy sanity checks
+        # count how many scene objects a prediction covers, and they cannot do
+        # that on the intensity image: thresholding an acquisition lights up the
+        # whole head as one component. It is never a model input - see
+        # STAGE_B_NON_INPUT_KEYS.
+        scene_occupancy = (labels != 0).astype(np.float32)
 
         directions, shape_ids = clause_indices(relations)
         item = {
@@ -464,6 +590,7 @@ class ExampleDataset(Dataset):
             "anchor_union_mask": torch.from_numpy(
                 anchor_masks.max(axis=0)
             ).unsqueeze(0),
+            "scene_occupancy": torch.from_numpy(scene_occupancy).unsqueeze(0),
             "direction_ids": torch.tensor(directions, dtype=torch.long),
             "anchor_shape_ids": torch.tensor(shape_ids, dtype=torch.long),
             "example_id": metadata.example_id,
@@ -487,7 +614,7 @@ class ExampleDataset(Dataset):
         augment = "" if self.augment is None else f", {self.augment.describe()}"
         return (
             f"{self.split}: {len(self)} examples from {len(self.scene_ids)} scenes "
-            f"at {self.volume_shape} [{counts}]{augment}"
+            f"at {self.volume_shape} [{counts}], {self.image_policy.describe()}{augment}"
         )
 
 
@@ -495,6 +622,7 @@ class ExampleDataset(Dataset):
 STAGE_B_NON_INPUT_KEYS: tuple[str, ...] = (
     "target_mask",
     "anchor_union_mask",
+    "scene_occupancy",
     "example_id",
     "scene_id",
     "prompt",

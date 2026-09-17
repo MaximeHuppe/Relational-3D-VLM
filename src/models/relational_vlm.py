@@ -2,7 +2,7 @@
 
 Inputs are the ordered binary anchor-mask channels, the structured three-clause
 prompt (as closed-vocabulary indices), geometry features **derived from those
-masks**, and the binary scene occupancy. Occupancy is a decoder-side WHAT
+masks**, and the scene image. That image is a decoder-side WHAT
 stream: the encoder, fusion and intersection never see it. The model still must
 not receive ``instance_labels``, the target mask, the target class, the target
 centroid or the target instance ID - see
@@ -360,7 +360,11 @@ class RelationalVLM(nn.Module):
         return masks
 
     def prepare_occupancy(self, scene_volume: Tensor, masks: Tensor) -> Tensor:
-        """Binary occupancy at the mask grid, with the three anchors zeroed.
+        """The decoder-side WHAT stream: the scene with the three anchors zeroed.
+
+        ``scene_volume`` is the simulated MRI-like image on an appearance corpus
+        and the binary occupancy without one; either way the anchors are removed
+        so the decoder cannot simply reproduce a channel it was given.
 
         ``masks`` is the encoder input after :meth:`prepare_masks`, so the
         prompt-only baseline (zeroed anchors) leaves the full scene and the
@@ -402,7 +406,7 @@ class RelationalVLM(nn.Module):
                 slot. Channel ``i`` must be the anchor named in clause ``i``.
             direction_ids: ``[B, 3]`` zero-based direction indices.
             anchor_shape_ids: ``[B, 3]`` zero-based shape indices.
-            scene_volume: ``[B, 1, D, H, W]`` binary occupancy of the whole
+            scene_volume: ``[B, 1, D, H, W]`` image of the whole
                 scene. Passed to the decoder only; the encoder never sees it.
             return_evidence: also return the three 8^3 evidence maps.
         """

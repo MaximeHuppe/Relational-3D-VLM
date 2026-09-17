@@ -259,3 +259,77 @@ def test_prompt_sensitive_dummy_moves_or_collapses_with_occupancy_fixed(tmp_path
     assert report["localisation"]["verdict"] == "where_failure"
     assert not report["passed"]
     assert "where_failure" in report["table"]
+
+
+# ---------------------------------------------------------------------------
+# The component count runs on labels, not on the acquisition
+# ---------------------------------------------------------------------------
+def test_remaining_object_occupancy_prefers_the_label_derived_binary_volume():
+    """Thresholding an intensity image would return the whole head as one object.
+
+    The carving check would then report "one object" for any prediction at all,
+    so it must count on ``scene_occupancy`` — the binary foreground — whenever
+    the loader supplies one.
+    """
+    from src.evaluation.occupancy_sanity import remaining_object_occupancy
+
+    scene, anchors, _ = remaining_occupancy()
+    model = OccupancySnappingModel()
+    # An "acquisition": tissue everywhere, structures a little darker.
+    image = 0.6 - 0.15 * scene
+    batch = {
+        "anchor_masks": anchors,
+        "scene_volume": image,
+        "scene_occupancy": scene,
+    }
+    occupancy = remaining_object_occupancy(batch, model, model.prepare_masks(anchors))
+    assert torch.equal(occupancy, scene * (1.0 - anchors.amax(dim=1, keepdim=True)))
+    _, components = label_components(occupancy[0, 0].numpy() >= 0.5)
+    assert components == 3
+
+    # Thresholding the image instead would merge everything into one blob.
+    _, merged = label_components(image[0, 0].numpy() >= 0.5)
+    assert merged == 1
+
+
+def test_remaining_object_occupancy_falls_back_to_the_what_stream():
+    """Hand-built fixtures and appearance-free corpora have no scene_occupancy."""
+    from src.evaluation.occupancy_sanity import remaining_object_occupancy
+
+    scene, anchors, _ = remaining_occupancy()
+    model = OccupancySnappingModel()
+    masks = model.prepare_masks(anchors)
+    batch = {"anchor_masks": anchors, "scene_volume": scene}
+    assert torch.equal(
+        remaining_object_occupancy(batch, model, masks),
+        model.prepare_occupancy(scene, masks),
+    )
+
+
+def test_the_carving_check_still_catches_a_union_painter_on_an_image_corpus(tmp_path):
+    """A model that paints every remaining object must still be caught.
+
+    With the WHAT stream an intensity image, the model cannot derive that union
+    from its input any more - but the *check* still has to name it, and it does,
+    because it counts on ``scene_occupancy`` rather than on the image.
+    """
+    scene, anchors, target = remaining_occupancy()
+    remaining = scene * (1.0 - anchors.amax(dim=1, keepdim=True))
+
+    class UnionPainter(_DummyVLM):
+        def forward(self, anchor_masks, direction_ids, anchor_shape_ids, scene_volume, **kwargs):
+            return SimpleNamespace(logits=self._logits(remaining.expand_as(scene_volume)))
+
+    batch = {
+        "anchor_masks": anchors,
+        "direction_ids": torch.tensor([[0, 2, 4]], dtype=torch.long),
+        "anchor_shape_ids": torch.tensor([[0, 1, 2]], dtype=torch.long),
+        # An acquisition: tissue everywhere, structures slightly darker.
+        "scene_volume": 0.6 - 0.15 * scene,
+        "scene_occupancy": scene,
+        "target_mask": target,
+        "example_id": ["scene000_target_00"],
+    }
+    report = run_occupancy_sanity(UnionPainter(), [batch], output_dir=tmp_path, num_slices=0)
+    assert report["carving"]["passed"] is False
+    assert report["carving"]["union_fraction"] == 1.0

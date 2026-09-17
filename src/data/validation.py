@@ -44,6 +44,7 @@ class RejectionReason(str, Enum):
     EMPTY_OBJECT = "empty_object"
     OUT_OF_BOUNDS = "out_of_bounds"
     OVERLAP = "overlap"
+    OUTSIDE_BODY = "outside_body"
     TARGET_IN_ANCHOR_CHANNEL = "target_in_anchor_channel"
     CHANNEL_ANCHOR_MISMATCH = "channel_anchor_mismatch"
     ANCHOR_ORDER_MISMATCH = "anchor_order_mismatch"
@@ -154,6 +155,30 @@ def check_in_bounds(mask: np.ndarray, *, margin_voxels: int) -> None:
                 f"object spans {axis_name} in [{low}, {high}] of size {size}, "
                 f"violating the {margin_voxels}-voxel margin",
             )
+
+
+def check_inside_body(
+    center_world: Sequence[float],
+    half_extent_world: Sequence[float],
+    body,
+    *,
+    margin: float = 0.0,
+) -> None:
+    """Fail if an object's bounding box leaves the simulated head.
+
+    Only used when ``body.constrain_placement`` is on: structures have to sit
+    inside tissue for the appearance model to mean anything, so a placement
+    that pokes out into the air around the head is rejected like any other
+    invalid placement rather than quietly accepted.
+    """
+    if body is None:
+        return
+    if not body.contains_box(center_world, half_extent_world, margin=margin):
+        raise ValidationError(
+            RejectionReason.OUTSIDE_BODY,
+            f"object centred at {tuple(round(float(v), 2) for v in center_world)} is not "
+            "fully inside the body",
+        )
 
 
 def check_no_overlap(candidate: np.ndarray, occupancy: np.ndarray) -> None:

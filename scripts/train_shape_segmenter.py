@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Phase 1: train the Stage A promptable shape segmenter.
 
-One sample is a whole scene: the binary ``scene_volume`` goes in, one mask logit
+One sample is a whole scene: the scene image ``scene_volume`` goes in, one mask logit
 volume comes out per requested shape name. The target-class split filter does
 not apply here - it constrains which classes Stage B may be *supervised* on,
 while Stage A must learn all ten shapes so it can supply anchors by name in
@@ -52,7 +52,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="dataset directory (default: data/smoke with --smoke, else data/processed)",
     )
     parser.add_argument(
-        "--profile", default="laptop_mps", choices=("laptop_mps", "rtx5090"),
+        "--profile", default="rtx5090", choices=("laptop_mps", "rtx5090"),
         help="hardware profile from configs/train.yaml",
     )
     parser.add_argument(

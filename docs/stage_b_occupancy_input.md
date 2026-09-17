@@ -43,19 +43,23 @@ to copy.
 | Pass `instance_labels` or the target class | **No** | That is the answer key. Still forbidden. |
 | Read GT centroids from the manifest | **No** | Breaks oracle vs predicted interchangeability. |
 | Multiply the prediction by occupancy and stop | **No** | A 7-vox offset times occupancy is empty or a neighbour. The WHERE path still has to land on the right object; occupancy must *inform* the decoder, not replace it. |
-| **Occupancy as a decoder-side WHAT stream** | **Yes** | Encoder / fusion / intersection stay the WHERE path (anchors + prompt only). The binary scene is concatenated into the decoder so the head can carve the object that the relations pointed at. |
+| **Occupancy as a decoder-side WHAT stream** | **Yes** | Encoder / fusion / intersection stay the WHERE path (anchors + prompt only). The scene image is concatenated into the decoder so the head can carve the object that the relations pointed at. |
 
 MRI reading: Stage A (or a clinical segmenter) still supplies the three named
-anchors. The image itself — here the binary `scene_volume` — is what the
+anchors. The image itself — `scene_volume`, now a simulated MRI-like volume
+rather than a binary mask — is what the
 relational model is allowed to look at in order to recover shape. Later that
 channel is T1/T2. Instance maps and the target identity stay out.
 
 ## What the extra channel is (and is not)
 
-`scene_volume` is the binary foreground of **all ten** shapes, already stored
-per scene in `data/processed/scenes/<scene_id>.npz`. Schema check: it equals
-`instance_labels != 0`. It has **no instance ids**, no class colours, no
-target highlight.
+`scene_volume` is the image of the whole scene, containing **all ten** shapes,
+already stored per scene in `data/processed/scenes/<scene_id>/image.nii.gz`. It
+has **no instance ids**, no class colours, no target highlight, and its
+intensities are drawn independently of shape class so it cannot even say *what*
+a structure is. (When this was written it was the binary occupancy, whose schema
+check is that it equals `instance_labels != 0`; that volume is still stored, as
+`occupancy.nii.gz`, and `image_source="occupancy"` still selects it.)
 
 The model still must use the three relations to decide *which* of the ten
 connected components is the target. Occupancy only tells it the voxel set of
@@ -295,7 +299,7 @@ not become `instance_labels`.
 
 - [`docs/CLAUDE.md`](CLAUDE.md) Stage B paragraph: inputs are three ordered
   anchor channels, the structured prompt, geometry derived from those masks,
-  **and the binary scene occupancy**. Still forbidden: instance labels,
+  **and the scene image**. Still forbidden: instance labels,
   target mask, target class, target centroid, target instance id.
 - [`docs/stage_b_architecture.md`](stage_b_architecture.md): add a WHERE /
   WHAT subsection and redraw the pipeline text. Occupancy is a decoder skip
@@ -384,3 +388,29 @@ then return to catalog items A1 / D4, not to another occupancy trick.
 
 Do not implement those as extra default behaviour. Ship `enabled: true`,
 `mask_anchors: true`, `inject_at_resolutions: [16, 32, 64]`.
+
+---
+
+## Amendment: the WHAT stream is now an acquisition
+
+When this document was written, `scene_volume` was the binary foreground, and
+"carve the object the relations pointed at" meant copying a connected component
+out of a mask. Since `configs/appearance.yaml` was introduced it is the
+simulated MRI-like image ([`mri_appearance.md`](mri_appearance.md)), which
+changes how much the stream gives away:
+
+- carving is no longer free. The structures differ from the tissue around them
+  by a few percent, so the decoder has to separate a boundary rather than copy a
+  region that is already isolated. The concern this document opens with — high
+  Dice that comes from occupancy rather than from the prompt — is therefore
+  weaker than it was, but it is not gone, and the checks below still run.
+- the stream still says nothing about *which* structure is the target. Structure
+  intensities are drawn independently of shape class, deliberately.
+- the component count in the occupancy sanity report no longer runs on this
+  stream. Thresholding an acquisition returns the whole head as one component,
+  so `src.evaluation.occupancy_sanity.remaining_object_occupancy` counts on the
+  batch's label-derived `scene_occupancy` instead. That volume is analysis-only
+  and never reaches the model.
+
+`image_source="occupancy"` on `ExampleDataset` restores the binary stream this
+document describes, which is the baseline to measure the change against.

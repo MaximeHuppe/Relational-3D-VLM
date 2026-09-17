@@ -46,11 +46,31 @@ examples:
 
 storage:
   root: data/processed
-  # Scene arrays (scene_volume, instance_labels) are written once per scene;
-  # example records reference their scene and carry all metadata. Masks are
-  # materialised deterministically from instance_labels on load, and the loader
+  # A scene is a directory of NIfTI volumes: the simulated image, the instance
+  # labels, the binary occupancy and one mask per structure, plus scene.json
+  # with the seeds, the placed parameters and every appearance draw. Example
+  # records reference their scene and carry all metadata; the loader still
   # re-runs the channel/order consistency checks. See docs/dataset_schema.md.
-  scene_array_format: npz_compressed
+  #
+  # `npz_compressed` restores the single-file form of the previous milestone
+  # (scene_volume + instance_labels + image in one .npz). Both are readable by
+  # src.data.scene_io.load_scene, so an old corpus keeps working.
+  scene_array_format: nifti
+  # Also write, per retained example, its target mask and its three ordered
+  # anchor channels as a 4D volume, next to a JSON copy of its prompt record.
+  # Redundant with the per-structure masks, and on by default because it makes
+  # a single example openable in a viewer without deriving anything.
+  write_example_masks: true
+  # On-disk type of image.nii.gz. `uint16` is what a scanner writes: nibabel
+  # stores a scale factor in the header, so the volume reads back in its
+  # simulated units, at half the size of float32 and with a quantisation error
+  # (~1e-5) three orders of magnitude below the noise. `float32` stores the
+  # simulated values bit-exactly.
+  image_dtype: uint16
+  # Diagnostics written alongside the image: the noise-free tissue map, the
+  # bias field, the total partial-volume fraction and the head outline. Useful
+  # when tuning configs/appearance.yaml, roughly doubles the corpus size.
+  write_appearance_diagnostics: false
   example_manifest_format: jsonl
   # Manifests hold only the examples retained by the target-class filter.
   # --keep-all-candidates additionally writes <split>_candidates.jsonl with all

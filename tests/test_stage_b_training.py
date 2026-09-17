@@ -18,6 +18,7 @@ import numpy as np
 import pytest
 import torch
 
+from src.data.scene_io import load_scene
 from src.data.dataset import (
     DatasetError,
     ExampleDataset,
@@ -96,14 +97,28 @@ def test_items_match_the_stage_b_contract(dataset):
     assert float(item["anchor_masks"].sum(0).max()) == 1.0
     assert float((item["anchor_masks"].sum(0) * item["target_mask"][0]).sum()) == 0.0
     assert item["scene_volume"].shape == (1, depth, height, width)
+    # The WHAT stream is now the simulated acquisition, not a 0/1 occupancy: it
+    # is continuous, and its background is tissue rather than zero, so the
+    # decoder cannot copy a connected component out of it for free.
+    assert item["scene_volume"].dtype == torch.float32
+    assert len(item["scene_volume"].unique()) > 1000
+    outside = item["scene_volume"][0][item["anchor_masks"].sum(0) == 0]
+    assert float(outside.std()) > 0.0
+
+
+def test_the_occupancy_source_still_yields_the_binary_baseline():
+    """The previous milestone's binary WHAT stream stays available for ablation."""
+    dataset = ExampleDataset(
+        SMOKE_ROOT, "train", limit=1, include_scene_volume=True, image_source="occupancy"
+    )
+    item = dataset[0]
     assert set(item["scene_volume"].unique().tolist()) <= {0.0, 1.0}
 
 
 def test_the_channels_are_the_three_anchor_structures_of_the_scene(dataset):
-    """Oracle anchors = the .npz labels with everything but the anchors dropped."""
+    """Oracle anchors = the stored labels with everything but the anchors dropped."""
     record = dataset.records[0]
-    with np.load(record.path) as arrays:
-        labels = arrays["instance_labels"]
+    labels = load_scene(record.path).instance_labels
     item = dataset[0]
     for slot, instance_id in enumerate(record.metadata.anchor_instance_ids):
         expected = torch.from_numpy((labels == instance_id).astype("float32"))

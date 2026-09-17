@@ -17,7 +17,7 @@ stage_a:
   #      at ten names, so a learned table is the deterministic equivalent and
   #      keeps the text path free of synonyms.
   name: voxdense_shape_segmenter
-  in_channels: 1                  # binary scene_volume
+  in_channels: 1                  # the scene image (simulated MRI-like volume)
   num_prompts: 10                 # one mask logit per requested shape name
   stem_channels: 32
   encoder_channels: [32, 64, 128, 256]
@@ -75,9 +75,11 @@ stage_a:
 stage_b:
   # Relational target segmenter. Inputs are the three ordered anchor-mask
   # channels, the structured prompt, geometry features derived from those
-  # masks, and the binary scene occupancy (decoder-side WHAT stream).
+  # masks, and the scene image (decoder-side WHAT stream).
   # It never receives instance_labels, target_mask, target class, target
-  # centroid or target instance ID. Occupancy is not an encoder input.
+  # centroid or target instance ID. The image is not an encoder input, and its
+  # intensities are drawn independently of shape class, so it cannot name a
+  # structure - see configs/appearance.yaml.
   name: relational_vlm
   in_channels: 3                  # ordered anchor masks, one per clause slot
   out_channels: 1                 # single target logit volume at input resolution
@@ -88,8 +90,11 @@ stage_b:
   norm: instance
   activation: leaky_relu
   occupancy:
+    # Named `occupancy` for continuity: this is the decoder-side WHAT stream,
+    # which is the scene image on a corpus generated with an appearance model
+    # and the binary occupancy without one.
     enabled: true                # the WHAT stream
-    mask_anchors: true           # occupancy *= (1 - union of the 3 channels)
+    mask_anchors: true           # stream *= (1 - union of the 3 channels)
     inject_at_resolutions: [16, 32, 64]
     # Do not inject at 8³: that would put WHAT on the unconditioned bottleneck
     # and undo the WHERE/WHAT split.

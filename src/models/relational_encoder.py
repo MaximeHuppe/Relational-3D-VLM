@@ -9,7 +9,7 @@ This module is the WHERE encoder. It sees *only* the ordered anchor channels
 plus world XYZ. Occupancy, instance labels and the target mask must not be
 concatenated here: grounding queries that could see the target's own voxels
 would let the model ignore the prompt and pick "a blob that is not an anchor."
-The binary scene is a decoder-side WHAT stream instead.
+The scene image is a decoder-side WHAT stream instead.
 
 Normalised world coordinates ``(x, y, z)`` are concatenated to the features at
 every scale (64, 32, 16, 8), recomputed from the world frame at each resolution
