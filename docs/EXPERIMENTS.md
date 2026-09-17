@@ -18,9 +18,9 @@ Yes: **git commit + the command below + the config snapshot** is the recipe.
 | Piece           | Where it lives                                                         | What it pins                                                                   |
 | --------------- | ---------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
 | git commit      | table **commit** column; also `best.json` → `environment.git_revision` | the code, including `configs/*.yaml`                                           |
-| command line    | this page, and `runs/experiments/realistic-appearance/campaign.json`   | which arm, which flags, which checkpoint paths                                 |
+| command line    | this page, and `runs/experiments/<arm>/campaign.json`                  | which arm, which flags, which checkpoint paths                                 |
 | config snapshot | each run's `best.json` → `configs`                                     | resolved hyperparameters (epochs, lr, seed, early stopping, appearance, split) |
-| dataset         | `data/processed/run_metadata.json`                                     | the corpus those weights were trained on                                       |
+| dataset         | `data/processed/run_metadata.json` or `data/dataset_mri/run_metadata.json` | the corpus those weights were trained on                                 |
 
 
 The CLI selects the arm **and** the schedule: `--wandb-project`, `--epochs`, `--early-stopping-patience`, `--early-stopping-min-delta`, plus `--augment` / `--no-augment`, `--anchor-source`, `--stage-a-checkpoint`, `--profile`. Learning rate, seed and the rest are whatever `configs/train.yaml` said at that commit; the sidecar stores the snapshot so a later edit of the YAML cannot rewrite history.
@@ -255,7 +255,17 @@ Swap `--profile rtx5090` for `--profile laptop_mps` on Apple Silicon. That is th
 
 ### mri-like
 
-Not wired into the runner yet. Same Phase A / Phase B split as the realistic arm once that corpus exists.
+Run Phase A then Phase B (then dump each Stage B test set) with `scripts/run_mri_experiments.py`. That script is the source of the commands in this section. Same schedule and W&B projects as the realistic arm; only `--data-root`, run names, ids and the `dataset-mri-like` tag change.
+
+```bash
+.venv/bin/python scripts/run_mri_experiments.py              # rtx5090
+.venv/bin/python scripts/run_mri_experiments.py --profile laptop_mps
+.venv/bin/python scripts/run_mri_experiments.py --dry-run    # print, do not train
+.venv/bin/python scripts/run_mri_experiments.py --only EX-6 EX-10
+.venv/bin/python scripts/run_mri_experiments.py --skip-existing --no-evaluate
+```
+
+The corpus is `data/dataset_mri`. After each Stage B run the campaign also runs `scripts/evaluate.py` on the test split; pass `--no-evaluate` to skip that.
 
 #### Phase A
 
@@ -264,6 +274,52 @@ Not wired into the runner yet. Same Phase A / Phase B split as the realistic arm
 | EX-6 | shape | `dataset_mri_like` | `runs/shape_segmenter/dataset_mri_like/` | — | `relational-3d-vlm-phase-a` | mri-like | 50 | 0 | 0.005 | no | — | — | — | todo | — |
 | EX-8 | shape | `dataset_mri_like_aug` | `runs/shape_segmenter/dataset_mri_like_aug/` | — | `relational-3d-vlm-phase-a` | mri-like | 50 | 0 | 0.005 | yes | — | — | — | todo | — |
 
+##### EX-6 — `dataset_mri_like`
+
+Stage A, stored pose only.
+
+```bash
+.venv/bin/python scripts/train_shape_segmenter.py \
+    --data-root data/dataset_mri \
+    --output runs/shape_segmenter/dataset_mri_like \
+    --profile rtx5090 \
+    --epochs 50 \
+    --early-stopping-patience 0 \
+    --early-stopping-min-delta 0.005 \
+    --wandb-project relational-3d-vlm-phase-a \
+    --wandb-tag EX-6 \
+    --wandb-tag dataset_mri_like \
+    --wandb-tag phase-a \
+    --wandb-tag dataset-mri-like \
+    --wandb-tag epochs-50 \
+    --wandb-tag patience-0 \
+    --wandb-tag no-aug-a \
+    --no-augment
+```
+
+##### EX-8 — `dataset_mri_like_aug`
+
+Stage A, rotation on.
+
+```bash
+.venv/bin/python scripts/train_shape_segmenter.py \
+    --data-root data/dataset_mri \
+    --output runs/shape_segmenter/dataset_mri_like_aug \
+    --profile rtx5090 \
+    --epochs 50 \
+    --early-stopping-patience 0 \
+    --early-stopping-min-delta 0.005 \
+    --wandb-project relational-3d-vlm-phase-a \
+    --wandb-tag EX-8 \
+    --wandb-tag dataset_mri_like_aug \
+    --wandb-tag phase-a \
+    --wandb-tag dataset-mri-like \
+    --wandb-tag epochs-50 \
+    --wandb-tag patience-0 \
+    --wandb-tag aug-a \
+    --augment
+```
+
 #### Phase B
 
 | id | model | run | path | commit | project | dataset | epochs | patience | min_delta | aug A | aug B | anchors | stage A | status | val dice |
@@ -271,6 +327,118 @@ Not wired into the runner yet. Same Phase A / Phase B split as the realistic arm
 | EX-7 | relational | `pred_dataset_mri_like_augB` | `runs/relational_model/predicted/pred_dataset_mri_like_augB/` | — | `relational-3d-vlm-phase-b` | mri-like | 30 | 0 | 0.005 | no | yes | predicted | `dataset_mri_like` | todo | — |
 | EX-9 | relational | `pred_dataset_mri_like_augA_augB` | `runs/relational_model/predicted/pred_dataset_mri_like_augA_augB/` | — | `relational-3d-vlm-phase-b` | mri-like | 30 | 0 | 0.005 | yes | yes | predicted | `dataset_mri_like_aug` | todo | — |
 | EX-10 | relational | `oracle_dataset_mri_like` | `runs/relational_model/oracle/oracle_dataset_mri_like/` | — | `relational-3d-vlm-phase-b` | mri-like | 30 | 0 | 0.005 | — | no | oracle | — | todo | — |
+
+##### EX-7 — `pred_dataset_mri_like_augB`
+
+Stage B trained on EX-6's predicted anchors, with Stage B rotation. Needs EX-6 `best.pt`.
+
+```bash
+.venv/bin/python scripts/train_relational_model.py \
+    --phase oracle \
+    --anchor-source predicted \
+    --stage-a-checkpoint runs/shape_segmenter/dataset_mri_like/best.pt \
+    --data-root data/dataset_mri \
+    --output runs/relational_model/predicted/pred_dataset_mri_like_augB \
+    --profile rtx5090 \
+    --epochs 30 \
+    --early-stopping-patience 0 \
+    --early-stopping-min-delta 0.005 \
+    --wandb-project relational-3d-vlm-phase-b \
+    --wandb-tag EX-7 \
+    --wandb-tag pred_dataset_mri_like_augB \
+    --wandb-tag phase-b \
+    --wandb-tag dataset-mri-like \
+    --wandb-tag epochs-30 \
+    --wandb-tag patience-0 \
+    --wandb-tag aug-b \
+    --wandb-tag anchors-predicted \
+    --wandb-tag stage-a-dataset_mri_like \
+    --wandb-tag no-aug-a \
+    --augment
+```
+
+```bash
+.venv/bin/python scripts/evaluate.py \
+    --stage-b-checkpoint runs/relational_model/predicted/pred_dataset_mri_like_augB/best.pt \
+    --stage-a-checkpoint runs/shape_segmenter/dataset_mri_like/best.pt \
+    --data-root data/dataset_mri \
+    --split test \
+    --anchor-source predicted
+```
+
+##### EX-9 — `pred_dataset_mri_like_augA_augB`
+
+Stage B trained on EX-8's predicted anchors, with Stage B rotation. Needs EX-8 `best.pt`.
+
+```bash
+.venv/bin/python scripts/train_relational_model.py \
+    --phase oracle \
+    --anchor-source predicted \
+    --stage-a-checkpoint runs/shape_segmenter/dataset_mri_like_aug/best.pt \
+    --data-root data/dataset_mri \
+    --output runs/relational_model/predicted/pred_dataset_mri_like_augA_augB \
+    --profile rtx5090 \
+    --epochs 30 \
+    --early-stopping-patience 0 \
+    --early-stopping-min-delta 0.005 \
+    --wandb-project relational-3d-vlm-phase-b \
+    --wandb-tag EX-9 \
+    --wandb-tag pred_dataset_mri_like_augA_augB \
+    --wandb-tag phase-b \
+    --wandb-tag dataset-mri-like \
+    --wandb-tag epochs-30 \
+    --wandb-tag patience-0 \
+    --wandb-tag aug-b \
+    --wandb-tag anchors-predicted \
+    --wandb-tag stage-a-dataset_mri_like_aug \
+    --wandb-tag aug-a \
+    --augment
+```
+
+```bash
+.venv/bin/python scripts/evaluate.py \
+    --stage-b-checkpoint runs/relational_model/predicted/pred_dataset_mri_like_augA_augB/best.pt \
+    --stage-a-checkpoint runs/shape_segmenter/dataset_mri_like_aug/best.pt \
+    --data-root data/dataset_mri \
+    --split test \
+    --anchor-source predicted
+```
+
+##### EX-10 — `oracle_dataset_mri_like`
+
+Stage B on ground-truth anchors, stored pose only. Independent of Stage A.
+
+```bash
+.venv/bin/python scripts/train_relational_model.py \
+    --phase oracle \
+    --anchor-source oracle \
+    --data-root data/dataset_mri \
+    --output runs/relational_model/oracle/oracle_dataset_mri_like \
+    --profile rtx5090 \
+    --epochs 30 \
+    --early-stopping-patience 0 \
+    --early-stopping-min-delta 0.005 \
+    --wandb-project relational-3d-vlm-phase-b \
+    --wandb-tag EX-10 \
+    --wandb-tag oracle_dataset_mri_like \
+    --wandb-tag phase-b \
+    --wandb-tag dataset-mri-like \
+    --wandb-tag epochs-30 \
+    --wandb-tag patience-0 \
+    --wandb-tag no-aug-b \
+    --wandb-tag anchors-oracle \
+    --no-augment
+```
+
+```bash
+.venv/bin/python scripts/evaluate.py \
+    --stage-b-checkpoint runs/relational_model/oracle/oracle_dataset_mri_like/best.pt \
+    --data-root data/dataset_mri \
+    --split test \
+    --anchor-source oracle
+```
+
+Swap `--profile rtx5090` for `--profile laptop_mps` on Apple Silicon. That is the only hardware flag; batch size, precision and device then come from `configs/train.yaml` `hardware_profiles`.
 
 
 

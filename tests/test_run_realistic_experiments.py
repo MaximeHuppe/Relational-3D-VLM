@@ -12,7 +12,6 @@ from scripts.run_realistic_experiments import (
     EXPERIMENTS_BY_ID,
     PYTHON_DOC,
     REALISTIC_EXPERIMENTS,
-    Experiment,
     RunContext,
     documented_evaluate_command,
     documented_training_command,
@@ -45,18 +44,11 @@ def test_wandb_project_splits_on_phase_not_dataset():
     assert EXPERIMENTS_BY_ID["EX-3"].wandb_project == "relational-3d-vlm-phase-a"
     assert EXPERIMENTS_BY_ID["EX-2"].wandb_project == "relational-3d-vlm-phase-b"
     assert EXPERIMENTS_BY_ID["EX-5"].wandb_project == "relational-3d-vlm-phase-b"
-    # A later mri-like arm must share those two projects; dataset is only a tag.
-    mri_like_a = Experiment(
-        id="EX-6",
-        run="dataset_mri_like",
-        model="shape",
-        output=EXPERIMENTS_BY_ID["EX-1"].output,
-        augment=False,
-        epochs=50,
-        dataset="mri-like",
-    )
-    assert mri_like_a.wandb_project == EXPERIMENTS_BY_ID["EX-1"].wandb_project
-    assert "dataset-mri-like" in mri_like_a.wandb_tags()
+    from scripts.run_mri_experiments import EXPERIMENTS_BY_ID as MRI_BY_ID
+
+    # mri-like shares those two projects; dataset is only a tag.
+    assert MRI_BY_ID["EX-6"].wandb_project == EXPERIMENTS_BY_ID["EX-1"].wandb_project
+    assert "dataset-mri-like" in MRI_BY_ID["EX-6"].wandb_tags()
     assert "dataset-realistic" in EXPERIMENTS_BY_ID["EX-1"].wandb_tags()
 
 

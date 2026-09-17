@@ -1,28 +1,31 @@
 #!/usr/bin/env python3
-"""Run the realistic-appearance experiment matrix (EX-1 … EX-5).
+"""Run the mri-like experiment matrix (EX-6 … EX-10).
 
-The five hexagons in ``docs/EXPERIMENTS.md`` / ``docs/experiments/experiment_flowchart.drawio``,
-Phase A first then Phase B:
+Same Phase A / Phase B split as ``scripts/run_realistic_experiments.py``, against
+the ``data/dataset_mri`` corpus. The five hexagons in ``docs/EXPERIMENTS.md``:
 
-    EX-1  Stage A, no aug          dataset_realistic
-    EX-3  Stage A, with aug        dataset_realistic_aug
-    EX-2  Stage B, predicted+augB  pred_dataset_realistic_augB   ← EX-1
-    EX-4  Stage B, predicted+augA+augB  pred_dataset_realistic_augA_augB  ← EX-3
-    EX-5  Stage B, oracle, no aug  oracle_dataset_realistic
+    EX-6   Stage A, no aug          dataset_mri_like
+    EX-8   Stage A, with aug        dataset_mri_like_aug
+    EX-7   Stage B, predicted+augB  pred_dataset_mri_like_augB   ← EX-6
+    EX-9   Stage B, predicted+augA+augB  pred_dataset_mri_like_augA_augB  ← EX-8
+    EX-10  Stage B, oracle, no aug  oracle_dataset_mri_like
 
 Every flag that distinguishes an arm is on the command line, including the W&B
 project, epoch budget and early-stopping rule. Learning rate, seed and the rest
 come from ``configs/train.yaml`` at the git revision recorded in each run's
 ``best.json``. Re-running the same command at the same commit, against the same
-corpus (``data/processed/run_metadata.json``), is the reproduction recipe.
+corpus (``data/dataset_mri/run_metadata.json``), is the reproduction recipe.
+
+W&B projects stay ``relational-3d-vlm-phase-a`` / ``relational-3d-vlm-phase-b``;
+dataset is a tag (``dataset-mri-like``), not a third project.
 
 Examples::
 
-    .venv/bin/python scripts/run_realistic_experiments.py
-    .venv/bin/python scripts/run_realistic_experiments.py --profile laptop_mps
-    .venv/bin/python scripts/run_realistic_experiments.py --dry-run
-    .venv/bin/python scripts/run_realistic_experiments.py --only EX-1 EX-5
-    .venv/bin/python scripts/run_realistic_experiments.py --skip-existing --no-evaluate
+    .venv/bin/python scripts/run_mri_experiments.py
+    .venv/bin/python scripts/run_mri_experiments.py --profile laptop_mps
+    .venv/bin/python scripts/run_mri_experiments.py --dry-run
+    .venv/bin/python scripts/run_mri_experiments.py --only EX-6 EX-10
+    .venv/bin/python scripts/run_mri_experiments.py --skip-existing --no-evaluate
 """
 
 from __future__ import annotations
@@ -52,18 +55,17 @@ from src.training.experiment_campaign import (  # noqa: E402
     training_argv,
 )
 
-DEFAULT_DATA_ROOT = Path("data/processed")
+DEFAULT_DATA_ROOT = Path("data/dataset_mri")
 DEFAULT_PROFILE = "rtx5090"
-CAMPAIGN_DIR = Path("runs/experiments/realistic-appearance")
+CAMPAIGN_DIR = Path("runs/experiments/mri-like")
 
-# Re-export names the tests and docs pin on.
 __all__ = [
     "CAMPAIGN_DIR",
     "DEFAULT_DATA_ROOT",
     "DEFAULT_PROFILE",
     "EXPERIMENTS_BY_ID",
+    "MRI_EXPERIMENTS",
     "PYTHON_DOC",
-    "REALISTIC_EXPERIMENTS",
     "Experiment",
     "RunContext",
     "documented_evaluate_command",
@@ -76,76 +78,76 @@ __all__ = [
 ]
 
 
-REALISTIC_EXPERIMENTS: tuple[Experiment, ...] = (
+MRI_EXPERIMENTS: tuple[Experiment, ...] = (
     Experiment(
-        id="EX-1",
-        run="dataset_realistic",
+        id="EX-6",
+        run="dataset_mri_like",
         model="shape",
-        output=Path("runs/shape_segmenter/dataset_realistic"),
+        output=Path("runs/shape_segmenter/dataset_mri_like"),
         augment=False,
         epochs=STAGE_A_EPOCHS,
-        dataset="realistic",
+        dataset="mri-like",
     ),
     Experiment(
-        id="EX-3",
-        run="dataset_realistic_aug",
+        id="EX-8",
+        run="dataset_mri_like_aug",
         model="shape",
-        output=Path("runs/shape_segmenter/dataset_realistic_aug"),
+        output=Path("runs/shape_segmenter/dataset_mri_like_aug"),
         augment=True,
         epochs=STAGE_A_EPOCHS,
-        dataset="realistic",
+        dataset="mri-like",
     ),
     Experiment(
-        id="EX-2",
-        run="pred_dataset_realistic_augB",
+        id="EX-7",
+        run="pred_dataset_mri_like_augB",
         model="relational",
-        output=Path("runs/relational_model/predicted/pred_dataset_realistic_augB"),
+        output=Path("runs/relational_model/predicted/pred_dataset_mri_like_augB"),
         augment=True,
         epochs=STAGE_B_EPOCHS,
-        dataset="realistic",
+        dataset="mri-like",
         anchors="predicted",
-        stage_a_id="EX-1",
-        depends_on=("EX-1",),
+        stage_a_id="EX-6",
+        depends_on=("EX-6",),
     ),
     Experiment(
-        id="EX-4",
-        run="pred_dataset_realistic_augA_augB",
+        id="EX-9",
+        run="pred_dataset_mri_like_augA_augB",
         model="relational",
-        output=Path("runs/relational_model/predicted/pred_dataset_realistic_augA_augB"),
+        output=Path("runs/relational_model/predicted/pred_dataset_mri_like_augA_augB"),
         augment=True,
         epochs=STAGE_B_EPOCHS,
-        dataset="realistic",
+        dataset="mri-like",
         anchors="predicted",
-        stage_a_id="EX-3",
-        depends_on=("EX-3",),
+        stage_a_id="EX-8",
+        depends_on=("EX-8",),
     ),
     Experiment(
-        id="EX-5",
-        run="oracle_dataset_realistic",
+        id="EX-10",
+        run="oracle_dataset_mri_like",
         model="relational",
-        output=Path("runs/relational_model/oracle/oracle_dataset_realistic"),
+        output=Path("runs/relational_model/oracle/oracle_dataset_mri_like"),
         augment=False,
         epochs=STAGE_B_EPOCHS,
-        dataset="realistic",
+        dataset="mri-like",
         anchors="oracle",
     ),
 )
 
-EXPERIMENTS_BY_ID = register_experiments(REALISTIC_EXPERIMENTS)
+EXPERIMENTS_BY_ID = register_experiments(MRI_EXPERIMENTS)
 
 CAMPAIGN = CampaignConfig(
-    name="realistic-appearance",
-    dataset="realistic",
+    name="mri-like",
+    dataset="mri-like",
     data_root=DEFAULT_DATA_ROOT,
     campaign_dir=CAMPAIGN_DIR,
-    experiments=REALISTIC_EXPERIMENTS,
+    experiments=MRI_EXPERIMENTS,
     generate_hint=(
-        "no realistic corpus at {data_root}. Generate one first:\n"
-        f"  {PYTHON_DOC} scripts/generate_dataset.py --output-root {DEFAULT_DATA_ROOT}"
+        "no mri-like corpus at {data_root}. Expected manifests/ under "
+        f"{DEFAULT_DATA_ROOT}."
     ),
     description=__doc__ or "",
-    banner="REALISTIC-APPEARANCE EXPERIMENTS",
-    data_root_help=f"realistic corpus (default: {DEFAULT_DATA_ROOT})",
+    banner="MRI-LIKE EXPERIMENTS",
+    data_root_help=f"mri-like corpus (default: {DEFAULT_DATA_ROOT})",
 )
 
 
@@ -158,7 +160,7 @@ def documented_evaluate_command(experiment: Experiment, *, profile: str = DEFAUL
 
 
 def selected_experiments(only: Sequence[str] | None) -> list[Experiment]:
-    return _selected_experiments(only, EXPERIMENTS_BY_ID, experiments=REALISTIC_EXPERIMENTS)
+    return _selected_experiments(only, EXPERIMENTS_BY_ID, experiments=MRI_EXPERIMENTS)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
