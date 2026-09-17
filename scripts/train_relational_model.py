@@ -358,13 +358,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"EVALUATION on {args.eval_split} ({anchor_source} anchors)")
             print("-" * 78)
             print(report["table"])
-            if "anchor_quality" in report:
-                quality = report["anchor_quality"]
-                print(
-                    f"\n  anchor masks: dice {quality['anchor_dice']:.4f} "
-                    f"iou {quality['anchor_iou']:.4f} "
-                    f"empty {quality['empty_anchor_fraction']:.1%}"
-                )
+        # No training pass here, so there is only the one split to report.
+        print_anchor_quality(report, verbose=verbose)
         write_report(output_dir / f"evaluation_{args.eval_split}_{anchor_source}.json", report)
         if not args.skip_occupancy_sanity:
             sanity = trainer.occupancy_sanity(
@@ -421,6 +416,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         print("-" * 78)
         print(final["table"])
+    print_anchor_quality(
+        final, history[-1].train_anchor_quality if history else None, verbose=verbose
+    )
+    if verbose:
         print()
         print(f"checkpoints : {output_dir}/best.pt, {output_dir}/last.pt")
         print(f"history     : {output_dir}/history.json")
@@ -435,6 +434,52 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         print_occupancy_sanity(sanity, output_dir, verbose)
     return 0 if history else 1
+
+
+#: A training-split anchor Dice this far below the validation one is reported
+#: as a warning rather than left for the reader to spot.
+ANCHOR_SPLIT_GAP_WARNING = 0.10
+
+
+def print_anchor_quality(
+    val_metrics: dict, train_quality: dict | None = None, *, verbose: bool = True
+) -> None:
+    """Predicted-anchor quality on both splits, with the gap called out.
+
+    The two numbers answer different questions. Validation says how good Stage
+    A is on the corpus as stored; training says how good the anchors Stage B
+    actually learned from were. They diverge whenever Stage B is augmented and
+    Stage A is not - the training split is rotated per epoch and the validation
+    split never is - and that divergence is invisible if only one is printed.
+    """
+    val_quality = val_metrics.get("anchor_quality")
+    if not verbose or not (val_quality or train_quality):
+        return
+
+    def row(label: str, quality: dict | None) -> None:
+        if not quality:
+            return
+        print(
+            f"  anchor masks {label:<6} dice {quality['anchor_dice']:.4f} "
+            f"iou {quality['anchor_iou']:.4f} "
+            f"empty {quality['empty_anchor_fraction']:.1%}"
+        )
+
+    print()
+    row("train", train_quality)
+    row("val", val_quality)
+    if not (train_quality and val_quality):
+        return
+    gap = float(val_quality["anchor_dice"]) - float(train_quality["anchor_dice"])
+    if gap > ANCHOR_SPLIT_GAP_WARNING:
+        print(
+            f"  WARNING: Stage A is {gap:.3f} Dice worse on the training split than on\n"
+            f"           validation. Only the training split is augmented, so this is\n"
+            f"           Stage A meeting poses it never trained on - Stage B is being\n"
+            f"           supervised against anchors that largely do not match its prompt.\n"
+            f"           Retrain Stage A with --augment, or train Stage B with"
+            f" --no-augment."
+        )
 
 
 def write_report(path: Path, report: dict) -> None:

@@ -60,6 +60,30 @@ def _format_class_scores(class_scores: Mapping[str, float]) -> str:
     return f"[{inner}]"
 
 
+def _format_anchor_quality(train: Any, val: Any) -> str:
+    """``anchors tr 0.367 (21% empty)  va 0.893 (2% empty)`` for stdout.
+
+    Both splits on one row on purpose. With predicted anchors the training
+    split is augmented and the validation split is not, so the two numbers can
+    disagree badly; printing only the validation one is what let a Stage A that
+    had never seen a rotated volume look healthy while supplying the training
+    loop with mostly wrong anchors.
+    """
+
+    def one(tag: str, quality: Any) -> str:
+        if not isinstance(quality, Mapping):
+            return ""
+        dice = quality.get("anchor_dice")
+        if not _is_number(dice):
+            return ""
+        empty = quality.get("empty_anchor_fraction")
+        suffix = f" ({float(empty):.0%} empty)" if _is_number(empty) else ""
+        return f"{tag} {float(dice):.3f}{suffix}"
+
+    shown = [text for text in (one("tr", train), one("va", val)) if text]
+    return "anchors " + "  ".join(shown) if shown else ""
+
+
 def logging_config(
     *,
     extra_tags: Sequence[str] = (),
@@ -114,15 +138,28 @@ def metrics_from_stage_b(
     train_loss: float,
     train_components: Mapping[str, float],
     train_dice: float | None = None,
+    train_anchor_quality: Mapping[str, float] | None = None,
     val_metrics: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Train/val scalars Stage B logs each epoch (or overfit pass)."""
+    """Train/val scalars Stage B logs each epoch (or overfit pass).
+
+    ``train_anchor_quality`` and the ``anchor_quality`` carried inside
+    ``val_metrics`` are both reported, and they are not redundant: only the
+    training split is augmented, so predicted anchors can be healthy on val and
+    broken on train at the same time.
+    """
     metrics: dict[str, Any] = {
         "train_loss": float(train_loss),
         "train_components": dict(train_components),
     }
     if train_dice is not None:
         metrics["train_dice"] = float(train_dice)
+    if train_anchor_quality:
+        metrics["train_anchor_quality"] = {
+            key: float(value)
+            for key, value in train_anchor_quality.items()
+            if _is_number(value)
+        }
     if not val_metrics:
         return metrics
     overall = val_metrics.get("overall") or {}
@@ -384,6 +421,12 @@ class TrainingLogger:
                 continue
             if _is_number(value):
                 parts.append(f"{key} {float(value):.4f}")
+
+        anchors = _format_anchor_quality(
+            metrics.get("train_anchor_quality"), metrics.get("anchor_quality")
+        )
+        if anchors:
+            parts.append(anchors)
 
         parts.append(f"lr {lr:.2e}")
         if rank is not None:
