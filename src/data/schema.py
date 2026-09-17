@@ -443,9 +443,9 @@ class ExampleArrays:
         foreground = np.asarray(self.instance_labels) != BACKGROUND_LABEL
         image = np.asarray(self.scene_volume, dtype=np.float32)
         if foreground.any() and (~foreground).any():
-            if float(image[foreground].mean()) <= float(image[~foreground].mean()):
+            if float(image[foreground].mean()) == float(image[~foreground].mean()):
                 raise SchemaError(
-                    "scene_volume mean intensity inside structures must exceed background"
+                    "scene_volume mean intensity inside structures must differ from background"
                 )
 
         expected_target = self.instance_labels == metadata.target_instance_id

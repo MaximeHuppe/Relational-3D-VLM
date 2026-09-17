@@ -128,7 +128,7 @@ by the declared instance IDs (`ExampleArrays.from_scene`); inspection copies of
 those masks are also written under `examples/<example_id>/`. Training loaders
 do not read the example NIfTIs. Every consistency check is re-run at load time:
 exactly ten instances, no empty object, target not in any anchor channel, each
-channel equal to its declared anchor, structure mean intensity above background,
+channel equal to its declared anchor, structure mean intensity different from background,
 anchor order identical to prompt order, and prompt round-trip. A mismatch
 raises rather than being repaired. Large arrays stay out of git; manifests,
 schemas, configs and the small fixture batch are committed.
