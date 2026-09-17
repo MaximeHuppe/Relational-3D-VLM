@@ -23,8 +23,8 @@ common:
   # `patience` consecutive epochs. Set patience to 0 to run the full schedule.
   # Per-stage blocks may override this (including smoke).
   early_stopping:
-    patience: 0
-    min_delta: 0.01
+    patience: 5
+    min_delta: 0.005
 
 # Experiment tracking. Backend ``wandb`` mirrors per-epoch train/val losses and
 # metrics to Weights & Biases (and still writes runs/<name>/metrics.jsonl).
@@ -32,8 +32,8 @@ common:
 logging:
   backend: wandb
   wandb:
-    project: shape-segmenter
-    tags: [shape-segmenter, augmentation, occupancy-volume, dataset-custom, epoch50]
+    project: relational-3d-vlm
+    tags: [relational-3d-vlm, augmentation, occupancy-volume, dataset-custom, epoch50]
 
 hardware_profiles:
   laptop_mps:
