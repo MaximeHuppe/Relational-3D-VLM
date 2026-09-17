@@ -726,6 +726,13 @@ class StageBEpochResult:
     val_metrics: dict[str, Any]
     learning_rate: float
     seconds: float
+    #: Anchor Dice/IoU/empty-fraction measured on the *training* split during
+    #: this epoch. Empty for oracle anchors, which are the reference by
+    #: definition. The validation counterpart lives in
+    #: ``val_metrics["anchor_quality"]``, and the two are not interchangeable:
+    #: only the training split is augmented, so a Stage A that is not
+    #: rotation-robust reads healthy on val and broken here.
+    train_anchor_quality: dict[str, float] = field(default_factory=dict)
 
     @property
     def val_dice(self) -> float:
@@ -737,6 +744,7 @@ class StageBEpochResult:
             "train_loss": self.train_loss,
             "train_components": self.train_components,
             "train_dice": self.train_dice,
+            "train_anchor_quality": self.train_anchor_quality,
             "val": {k: v for k, v in self.val_metrics.items() if k != "table"},
             "learning_rate": self.learning_rate,
             "seconds": self.seconds,
@@ -800,6 +808,9 @@ class StageBTrainer:
             device=self.device.type, enabled=settings.needs_grad_scaler
         )
         self.history: list[StageBEpochResult] = []
+        #: Anchor quality on the training split, refreshed by every
+        #: :meth:`train_epoch`. See :class:`StageBEpochResult`.
+        self.train_anchor_quality: dict[str, float] = {}
         self.best_dice = -1.0
         self.best_epoch = -1
         self.early_stopping = EarlyStopping(
@@ -828,6 +839,17 @@ class StageBTrainer:
         anchor_masks = self.anchor_provider(batch).to(self.device)
         return self.model(**stage_b_model_inputs(batch, anchor_masks))
 
+    def _reset_anchor_quality(self) -> None:
+        """Start a fresh anchor-quality accumulation on the provider."""
+        reset = getattr(self.anchor_provider, "reset", None)
+        if callable(reset):
+            reset()
+
+    def _collect_anchor_quality(self) -> dict[str, float]:
+        """Whatever the provider accumulated since the last reset."""
+        quality = getattr(self.anchor_provider, "anchor_quality", None)
+        return dict(quality()) if callable(quality) else {}
+
     def _loss(self, logits: Tensor, batch: Mapping[str, Any]):
         return segmentation_loss(
             logits.float(),
@@ -838,13 +860,24 @@ class StageBTrainer:
 
     # -- training ----------------------------------------------------------
     def train_epoch(self, epoch: int) -> tuple[float, dict[str, float], float]:
-        """One pass over the training examples. Returns loss, components, Dice."""
+        """One pass over the training examples. Returns loss, components, Dice.
+
+        The anchor quality of this pass is left in
+        :attr:`train_anchor_quality` rather than returned, so the tuple keeps
+        the shape every caller already unpacks.
+        """
         self.model.train()
         accumulation = max(self.settings.gradient_accumulation_steps, 1)
         totals: dict[str, float] = {}
         total_loss, total_dice, steps = 0.0, 0.0, 0
         self.optimizer.zero_grad(set_to_none=True)
         _set_loader_epoch(self.train_loader, epoch)
+        # Anchor statistics describe *this* epoch. Without the reset they would
+        # run from the start of training; without the collection at the end of
+        # the pass they would be discarded by the reset at the top of
+        # `evaluate`, which is how a Stage A that cannot handle the augmented
+        # training poses stays invisible behind a healthy validation number.
+        self._reset_anchor_quality()
 
         progress = _epoch_progress(
             self.train_loader,
@@ -887,6 +920,7 @@ class StageBTrainer:
             self.scaler.update()
             self.optimizer.zero_grad(set_to_none=True)
 
+        self.train_anchor_quality = self._collect_anchor_quality()
         divisor = max(steps, 1)
         return (
             total_loss / divisor,
@@ -913,10 +947,9 @@ class StageBTrainer:
             return {}
         self.model.eval()
         # Anchor statistics describe *this* evaluation, not everything the
-        # provider has seen since the run started.
-        reset = getattr(self.anchor_provider, "reset", None)
-        if callable(reset):
-            reset()
+        # provider has seen since the run started. `train_epoch` banks its own
+        # numbers before this runs, so the reset cannot lose them.
+        self._reset_anchor_quality()
         metrics = StratifiedMetrics()
         total_loss, steps = 0.0, 0
         for raw in loader:
@@ -941,11 +974,9 @@ class StageBTrainer:
         summary = metrics.summary()
         summary["loss"] = total_loss / max(steps, 1)
         summary["anchor_source"] = getattr(self.anchor_provider, "source", "oracle")
-        quality = getattr(self.anchor_provider, "anchor_quality", None)
-        if callable(quality):
-            measured = quality()
-            if measured:
-                summary["anchor_quality"] = measured
+        measured = self._collect_anchor_quality()
+        if measured:
+            summary["anchor_quality"] = measured
         summary["table"] = format_stratified_table(summary)
         return summary
 
@@ -968,9 +999,7 @@ class StageBTrainer:
 
         loader = loader or self.val_loader or self.train_loader
         self.model.eval()
-        reset = getattr(self.anchor_provider, "reset", None)
-        if callable(reset):
-            reset()
+        self._reset_anchor_quality()
 
         def prepare_batch(batch: Mapping[str, Any]) -> dict[str, Any]:
             moved = self._to_device(batch)
@@ -1005,6 +1034,7 @@ class StageBTrainer:
             for epoch in range(self.settings.epochs):
                 started = time.perf_counter()
                 train_loss, components, train_dice = self.train_epoch(epoch)
+                train_anchors = dict(self.train_anchor_quality)
                 self.scheduler.step()
                 val_metrics = self.evaluate()
                 result = StageBEpochResult(
@@ -1012,6 +1042,7 @@ class StageBTrainer:
                     train_loss=train_loss,
                     train_components=components,
                     train_dice=train_dice,
+                    train_anchor_quality=train_anchors,
                     val_metrics=val_metrics,
                     learning_rate=float(self.optimizer.param_groups[0]["lr"]),
                     seconds=time.perf_counter() - started,
@@ -1036,6 +1067,7 @@ class StageBTrainer:
                         train_loss=train_loss,
                         train_components=components,
                         train_dice=train_dice,
+                        train_anchor_quality=train_anchors,
                         val_metrics=val_metrics,
                     ),
                     result.learning_rate,
@@ -1162,6 +1194,7 @@ class StageBOverfitRunner(StageBTrainer):
             while self.steps_run < budget and not self.reached_target:
                 # One pass over the single scene is one epoch's worth of poses.
                 _set_loader_epoch(self.train_loader, pass_index)
+                self._reset_anchor_quality()
                 losses: list[float] = []
                 dices: list[float] = []
                 totals: dict[str, float] = {}
@@ -1201,10 +1234,12 @@ class StageBOverfitRunner(StageBTrainer):
                 self.trace.append(
                     {"pass": pass_index, "steps": self.steps_run, "loss": mean_loss, "dice": mean_dice}
                 )
+                self.train_anchor_quality = self._collect_anchor_quality()
                 pass_metrics = metrics_from_stage_b(
                     train_loss=mean_loss,
                     train_components=mean_components,
                     train_dice=mean_dice,
+                    train_anchor_quality=self.train_anchor_quality,
                 )
                 if self.verbose and (pass_index % 10 == 0 or mean_dice >= self.settings.target_train_dice):
                     print(
@@ -1263,6 +1298,10 @@ class StageBOverfitRunner(StageBTrainer):
             "step_budget": int(self.settings.steps),
             "seconds": seconds,
             "anchor_source": getattr(self.anchor_provider, "source", "oracle"),
+            # From the last training pass, not from `final_metrics` above: the
+            # overfit set is the augmented training split, so this is the only
+            # number that says what the model was actually fed.
+            "train_anchor_quality": dict(self.train_anchor_quality),
             "examples": int(len(self.train_loader.dataset)),  # type: ignore[arg-type]
             "metrics": {k: v for k, v in metrics.items() if k != "table"},
             "trace": self.trace,

@@ -30,6 +30,7 @@ from src.data.schema import STAGE_B_FORBIDDEN_FIELDS, read_manifest
 from src.evaluation.metrics import (
     StratifiedMetrics,
     batch_hausdorff,
+    dice_score,
     format_stratified_table,
     hausdorff_distance,
     surface_voxels,
@@ -434,6 +435,99 @@ def test_a_few_stage_b_steps_reduce_the_loss(dataset, tmp_path):
     assert metadata["selection_metric"] == "val_dice"
     assert metadata["versions"]["schema_version"]
     assert metadata["extra"]["anchors"]["anchor_source"] == "oracle"
+
+
+class _SplitSensitiveProvider:
+    """Perfect anchors in eval, empty ones in train, scoring itself like the real one.
+
+    A stand-in for the asymmetry that actually occurs: only the training split
+    is augmented, so a Stage A that was trained on one pose can segment the
+    validation scenes perfectly and the training scenes not at all.
+    """
+
+    source = "predicted"
+
+    def __init__(self, model) -> None:
+        self.model = model
+        self.reset()
+
+    def __call__(self, batch):
+        reference = batch["anchor_masks"].to(torch.float32)
+        masks = torch.zeros_like(reference) if self.model.training else reference
+        self._dice.extend(dice_score(masks, reference).flatten().tolist())
+        self._empty += int((masks.flatten(2).sum(-1) == 0).sum())
+        self._channels += int(masks.shape[0] * masks.shape[1])
+        return masks
+
+    def anchor_quality(self) -> dict[str, float]:
+        if not self._dice:
+            return {}
+        return {
+            "anchor_dice": sum(self._dice) / len(self._dice),
+            "anchor_iou": 0.0,
+            "empty_anchor_fraction": self._empty / max(self._channels, 1),
+            "channels": float(self._channels),
+        }
+
+    def reset(self) -> None:
+        self._dice: list[float] = []
+        self._empty = 0
+        self._channels = 0
+
+
+def test_anchor_quality_is_reported_per_split_not_only_for_validation(dataset, tmp_path):
+    """The training split's anchors must survive the reset at the top of evaluate.
+
+    Regression guard. `evaluate` resets the provider so its numbers describe
+    that evaluation alone, and the validation split is never augmented - so
+    before `train_epoch` banked its own measurement, predicted anchors that
+    were useless on every training batch still reported a perfect score.
+    """
+    seed_everything(0)
+    loader = build_example_dataloader(dataset, batch_size=2)
+    model = RelationalVLM(SMALL)
+    trainer = StageBTrainer(
+        model,
+        TrainingSettings(epochs=1, batch_size=2, device="cpu", warmup_epochs=0, seed=0),
+        loader,
+        loader,
+        output_dir=tmp_path,
+        verbose=False,
+        anchor_provider=_SplitSensitiveProvider(model),
+    )
+    history = trainer.fit()
+
+    train_quality = history[-1].train_anchor_quality
+    val_quality = history[-1].val_metrics["anchor_quality"]
+    assert train_quality["anchor_dice"] == pytest.approx(0.0)
+    assert train_quality["empty_anchor_fraction"] == pytest.approx(1.0)
+    assert val_quality["anchor_dice"] == pytest.approx(1.0)
+    assert val_quality["empty_anchor_fraction"] == pytest.approx(0.0)
+
+    # Both splits reach the metrics stream and the on-disk history.
+    record = json.loads((tmp_path / "metrics.jsonl").read_text().splitlines()[-1])
+    assert record["train_anchor_quality"]["anchor_dice"] == pytest.approx(0.0)
+    assert record["anchor_quality"]["anchor_dice"] == pytest.approx(1.0)
+    saved = json.loads((tmp_path / "history.json").read_text())[-1]
+    assert saved["train_anchor_quality"]["anchor_dice"] == pytest.approx(0.0)
+
+
+def test_oracle_anchors_report_no_train_quality_because_they_are_the_reference(
+    dataset, tmp_path
+):
+    seed_everything(0)
+    loader = build_example_dataloader(dataset, batch_size=2)
+    trainer = StageBTrainer(
+        RelationalVLM(SMALL),
+        TrainingSettings(epochs=1, batch_size=2, device="cpu", warmup_epochs=0, seed=0),
+        loader,
+        loader,
+        output_dir=tmp_path,
+        verbose=False,
+    )
+    history = trainer.fit()
+    assert history[-1].train_anchor_quality == {}
+    assert "anchor_quality" not in history[-1].val_metrics
 
 
 def test_the_evaluation_report_is_stratified_and_names_its_anchor_source(dataset, tmp_path):

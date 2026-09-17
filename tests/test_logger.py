@@ -8,6 +8,7 @@ from src.training.logger import (
     METRICS_FILENAME,
     TrainingLogger,
     _flatten_metrics,
+    _format_anchor_quality,
     _jsonify_metric,
     logging_config,
     metrics_from_stage_a,
@@ -171,3 +172,31 @@ def test_logging_config_appends_tags_from_train_yaml():
     assert "stage_a" in cfg["wandb"]["tags"]
     assert "smoke" in cfg["wandb"]["tags"]
     assert "relational-3d-vlm" in cfg["wandb"]["tags"]
+
+
+def test_the_epoch_row_shows_anchor_quality_for_both_splits():
+    """The gap between the two is the signal, so neither may be dropped."""
+    row = _format_anchor_quality(
+        {"anchor_dice": 0.3671, "empty_anchor_fraction": 0.2149},
+        {"anchor_dice": 0.8929, "empty_anchor_fraction": 0.0167},
+    )
+    assert row == "anchors tr 0.367 (21% empty)  va 0.893 (2% empty)"
+    # Oracle anchors report nothing at all rather than a misleading 1.000.
+    assert _format_anchor_quality(None, None) == ""
+    assert _format_anchor_quality(None, {"anchor_dice": 0.5}) == "anchors va 0.500"
+
+
+def test_stage_b_metrics_carry_the_training_split_anchor_quality():
+    metrics = metrics_from_stage_b(
+        train_loss=1.0,
+        train_components={},
+        train_dice=0.1,
+        train_anchor_quality={"anchor_dice": 0.367, "channels": 8400.0},
+        val_metrics={"overall": {"dice": 0.05, "iou": 0.03}, "anchor_quality": {"anchor_dice": 0.893}},
+    )
+    assert metrics["train_anchor_quality"] == {"anchor_dice": 0.367, "channels": 8400.0}
+    assert metrics["anchor_quality"] == {"anchor_dice": 0.893}
+    # Flattened for W&B, the two stay distinguishable.
+    flat = _flatten_metrics(metrics)
+    assert flat["train_anchor_quality/anchor_dice"] == 0.367
+    assert flat["anchor_quality/anchor_dice"] == 0.893
