@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Run the realistic-appearance experiment matrix (EX-1 … EX-5).
 
-The five hexagons in ``docs/EXPERIMENTS.md`` / ``docs/experiments/experiment_flowchart.drawio``:
+The five hexagons in ``docs/EXPERIMENTS.md`` / ``docs/experiments/experiment_flowchart.drawio``,
+Phase A first then Phase B:
 
     EX-1  Stage A, no aug          dataset_realistic
-    EX-2  Stage B, predicted+augB  pred_dataset_realistic_augB   ← EX-1
     EX-3  Stage A, with aug        dataset_realistic_aug
+    EX-2  Stage B, predicted+augB  pred_dataset_realistic_augB   ← EX-1
     EX-4  Stage B, predicted+augA+augB  pred_dataset_realistic_augA_augB  ← EX-3
     EX-5  Stage B, oracle, no aug  oracle_dataset_realistic
 
@@ -44,7 +45,8 @@ from src.provenance import git_is_dirty, git_revision  # noqa: E402
 
 DEFAULT_DATA_ROOT = Path("data/processed")
 DEFAULT_PROFILE = "rtx5090"
-DEFAULT_WANDB_PROJECT = "relational-3d-vlm-realistic"
+WANDB_PROJECT_PHASE_A = "relational-3d-vlm-phase-a"
+WANDB_PROJECT_PHASE_B = "relational-3d-vlm-phase-b"
 STAGE_A_EPOCHS = 50
 STAGE_B_EPOCHS = 30
 EARLY_STOPPING_PATIENCE = 0
@@ -61,11 +63,11 @@ class Experiment:
 
     id: str
     run: str
-    model: str                      # "shape" or "relational"
+    model: str                      # "shape" (Phase A) or "relational" (Phase B)
     output: Path                    # relative to the project root
     augment: bool
     epochs: int
-    wandb_project: str = DEFAULT_WANDB_PROJECT
+    dataset: str = "realistic"
     early_stopping_patience: int = EARLY_STOPPING_PATIENCE
     early_stopping_min_delta: float = EARLY_STOPPING_MIN_DELTA
     anchors: str | None = None      # None for Stage A; "oracle" / "predicted" for Stage B
@@ -76,8 +78,39 @@ class Experiment:
     def checkpoint(self) -> Path:
         return self.output / "best.pt"
 
+    @property
+    def phase(self) -> str:
+        return "a" if self.model == "shape" else "b"
 
-# Table order in docs/EXPERIMENTS.md. EX-2 needs EX-1; EX-4 needs EX-3.
+    @property
+    def wandb_project(self) -> str:
+        """Phase A and Phase B are two W&B projects; dataset is a tag, not the split."""
+        return WANDB_PROJECT_PHASE_A if self.phase == "a" else WANDB_PROJECT_PHASE_B
+
+    def wandb_tags(self) -> tuple[str, ...]:
+        """W&B tags derived from the EXPERIMENTS.md row, not from train.yaml leftovers."""
+        tags = [
+            self.id,
+            self.run,
+            f"phase-{self.phase}",
+            f"dataset-{self.dataset}",
+            f"epochs-{self.epochs}",
+            f"patience-{self.early_stopping_patience}",
+        ]
+        if self.model == "shape":
+            tags.append("aug-a" if self.augment else "no-aug-a")
+            return tuple(tags)
+        tags.append("aug-b" if self.augment else "no-aug-b")
+        if self.anchors:
+            tags.append(f"anchors-{self.anchors}")
+        if self.stage_a_id is not None:
+            stage_a = EXPERIMENTS_BY_ID[self.stage_a_id]
+            tags.append(f"stage-a-{stage_a.run}")
+            tags.append("aug-a" if stage_a.augment else "no-aug-a")
+        return tuple(tags)
+
+
+# Phase A first so predicted Stage B always finds its checkpoint; then Phase B.
 REALISTIC_EXPERIMENTS: tuple[Experiment, ...] = (
     Experiment(
         id="EX-1",
@@ -85,6 +118,14 @@ REALISTIC_EXPERIMENTS: tuple[Experiment, ...] = (
         model="shape",
         output=Path("runs/shape_segmenter/dataset_realistic"),
         augment=False,
+        epochs=STAGE_A_EPOCHS,
+    ),
+    Experiment(
+        id="EX-3",
+        run="dataset_realistic_aug",
+        model="shape",
+        output=Path("runs/shape_segmenter/dataset_realistic_aug"),
+        augment=True,
         epochs=STAGE_A_EPOCHS,
     ),
     Experiment(
@@ -97,14 +138,6 @@ REALISTIC_EXPERIMENTS: tuple[Experiment, ...] = (
         anchors="predicted",
         stage_a_id="EX-1",
         depends_on=("EX-1",),
-    ),
-    Experiment(
-        id="EX-3",
-        run="dataset_realistic_aug",
-        model="shape",
-        output=Path("runs/shape_segmenter/dataset_realistic_aug"),
-        augment=True,
-        epochs=STAGE_A_EPOCHS,
     ),
     Experiment(
         id="EX-4",
@@ -147,13 +180,16 @@ def _augment_flag(enabled: bool) -> str:
 
 
 def _schedule_flags(experiment: Experiment) -> list[str]:
-    """Epochs, early stopping and W&B project — the columns that must be on the CLI."""
-    return [
+    """Epochs, early stopping, W&B project and tags derived from the table row."""
+    flags = [
         "--epochs", str(experiment.epochs),
         "--early-stopping-patience", str(experiment.early_stopping_patience),
         "--early-stopping-min-delta", str(experiment.early_stopping_min_delta),
         "--wandb-project", experiment.wandb_project,
     ]
+    for tag in experiment.wandb_tags():
+        flags.extend(["--wandb-tag", tag])
+    return flags
 
 
 def stage_a_checkpoint(experiment: Experiment) -> Path:
@@ -255,7 +291,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--only", nargs="+", metavar="EX-N", default=None,
-        help="run these ids only (default: EX-1 … EX-5 in table order)",
+        help="run these ids only (default: Phase A then Phase B)",
     )
     parser.add_argument(
         "--profile", default=DEFAULT_PROFILE, choices=("laptop_mps", "rtx5090"),

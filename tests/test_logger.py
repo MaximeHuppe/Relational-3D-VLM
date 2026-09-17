@@ -175,10 +175,16 @@ def test_logging_config_appends_tags_from_train_yaml():
 
 
 def test_logging_config_can_override_the_wandb_project():
-    cfg = logging_config(project="relational-3d-vlm-realistic")
-    assert cfg["wandb"]["project"] == "relational-3d-vlm-realistic"
+    cfg = logging_config(project="relational-3d-vlm-phase-a")
+    assert cfg["wandb"]["project"] == "relational-3d-vlm-phase-a"
     default = logging_config()
     assert default["wandb"]["project"] == "relational-3d-vlm"
+
+
+def test_logging_config_cli_tags_replace_yaml_leftovers():
+    cfg = logging_config(tags=["EX-1", "phase-a", "dataset-realistic"])
+    assert cfg["wandb"]["tags"] == ["EX-1", "phase-a", "dataset-realistic"]
+    assert "dataset-custom" not in cfg["wandb"]["tags"]
 
 
 def test_the_epoch_row_shows_anchor_quality_for_both_splits():

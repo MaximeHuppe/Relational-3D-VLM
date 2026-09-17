@@ -89,20 +89,26 @@ def logging_config(
     extra_tags: Sequence[str] = (),
     config: Mapping[str, Any] | None = None,
     project: str | None = None,
+    tags: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     """``configs/train.yaml`` logging block, with optional extra W&B tags.
 
     ``project`` overrides ``logging.wandb.project`` so a campaign can sit in
-    its own W&B project without editing the YAML.
+    its own W&B project without editing the YAML. ``tags``, when given,
+    *replaces* ``logging.wandb.tags`` (the YAML list is a leftover of the last
+    ad-hoc run); ``extra_tags`` still append.
     """
     train = dict(config if config is not None else load_config("train"))
     log_cfg = dict(train.get("logging") or {})
     wandb_cfg = dict(log_cfg.get("wandb") or {})
-    tags = [str(tag) for tag in (wandb_cfg.get("tags") or [])]
+    if tags is not None:
+        wandb_tags = [str(tag) for tag in tags if tag]
+    else:
+        wandb_tags = [str(tag) for tag in (wandb_cfg.get("tags") or [])]
     for tag in extra_tags:
-        if tag and tag not in tags:
-            tags.append(str(tag))
-    wandb_cfg["tags"] = tags
+        if tag and tag not in wandb_tags:
+            wandb_tags.append(str(tag))
+    wandb_cfg["tags"] = wandb_tags
     if project:
         wandb_cfg["project"] = project
     log_cfg["wandb"] = wandb_cfg

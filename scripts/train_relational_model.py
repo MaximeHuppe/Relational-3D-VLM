@@ -145,6 +145,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--wandb-project", default=None,
         help="Weights & Biases project (default: logging.wandb.project in configs/train.yaml)",
     )
+    parser.add_argument(
+        "--wandb-tag", action="append", dest="wandb_tags", default=None,
+        help="W&B tag (repeatable). When any are passed they replace logging.wandb.tags",
+    )
     parser.add_argument("--steps", type=int, default=None, help="Phase 2 step budget")
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--learning-rate", type=float, default=None)
@@ -246,6 +250,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.variant or "",
         ],
         project=args.wandb_project,
+        tags=args.wandb_tags,
     )
     run_name = output_dir.name
     full_config = load_all_configs()
@@ -302,7 +307,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     val_loader = (
         build_example_dataloader(
-            val_dataset, batch_size=settings.batch_size, num_workers=settings.num_workers
+            val_dataset,
+            batch_size=settings.batch_size,
+            num_workers=settings.num_workers,
+            seed=settings.seed,
         )
         if val_dataset is not None
         else None

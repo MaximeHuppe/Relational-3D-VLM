@@ -73,6 +73,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--wandb-project", default=None,
         help="Weights & Biases project (default: logging.wandb.project in configs/train.yaml)",
     )
+    parser.add_argument(
+        "--wandb-tag", action="append", dest="wandb_tags", default=None,
+        help="W&B tag (repeatable). When any are passed they replace logging.wandb.tags",
+    )
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--learning-rate", type=float, default=None)
     parser.add_argument("--device", default=None, help="cpu, mps, cuda or auto")
@@ -175,7 +179,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         seed=settings.seed,
     )
     val_loader = build_dataloader(
-        val_dataset, batch_size=settings.batch_size, num_workers=settings.num_workers
+        val_dataset,
+        batch_size=settings.batch_size,
+        num_workers=settings.num_workers,
+        seed=settings.seed,
     )
 
     model = build_shape_segmenter(
@@ -208,6 +215,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         log_cfg=logging_config(
             extra_tags=["stage_a", "smoke" if args.smoke else ""],
             project=args.wandb_project,
+            tags=args.wandb_tags,
         ),
         run_name=output_dir.name,
         full_config=load_all_configs(),

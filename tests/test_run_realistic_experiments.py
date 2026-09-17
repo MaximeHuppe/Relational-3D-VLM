@@ -12,6 +12,7 @@ from scripts.run_realistic_experiments import (
     EXPERIMENTS_BY_ID,
     PYTHON_DOC,
     REALISTIC_EXPERIMENTS,
+    Experiment,
     RunContext,
     documented_evaluate_command,
     documented_training_command,
@@ -25,7 +26,7 @@ from scripts.run_realistic_experiments import (
 
 def test_the_five_hexagons_match_the_experiments_table():
     assert [item.id for item in REALISTIC_EXPERIMENTS] == [
-        "EX-1", "EX-2", "EX-3", "EX-4", "EX-5",
+        "EX-1", "EX-3", "EX-2", "EX-4", "EX-5",
     ]
     assert EXPERIMENTS_BY_ID["EX-1"].run == "dataset_realistic"
     assert EXPERIMENTS_BY_ID["EX-1"].output.as_posix() == "runs/shape_segmenter/dataset_realistic"
@@ -35,6 +36,44 @@ def test_the_five_hexagons_match_the_experiments_table():
     assert EXPERIMENTS_BY_ID["EX-4"].stage_a_id == "EX-3"
     assert EXPERIMENTS_BY_ID["EX-5"].anchors == "oracle"
     assert EXPERIMENTS_BY_ID["EX-5"].augment is False
+    assert all(item.phase == "a" for item in REALISTIC_EXPERIMENTS[:2])
+    assert all(item.phase == "b" for item in REALISTIC_EXPERIMENTS[2:])
+
+
+def test_wandb_project_splits_on_phase_not_dataset():
+    assert EXPERIMENTS_BY_ID["EX-1"].wandb_project == "relational-3d-vlm-phase-a"
+    assert EXPERIMENTS_BY_ID["EX-3"].wandb_project == "relational-3d-vlm-phase-a"
+    assert EXPERIMENTS_BY_ID["EX-2"].wandb_project == "relational-3d-vlm-phase-b"
+    assert EXPERIMENTS_BY_ID["EX-5"].wandb_project == "relational-3d-vlm-phase-b"
+    # A later mri-like arm must share those two projects; dataset is only a tag.
+    mri_like_a = Experiment(
+        id="EX-6",
+        run="dataset_mri_like",
+        model="shape",
+        output=EXPERIMENTS_BY_ID["EX-1"].output,
+        augment=False,
+        epochs=50,
+        dataset="mri-like",
+    )
+    assert mri_like_a.wandb_project == EXPERIMENTS_BY_ID["EX-1"].wandb_project
+    assert "dataset-mri-like" in mri_like_a.wandb_tags()
+    assert "dataset-realistic" in EXPERIMENTS_BY_ID["EX-1"].wandb_tags()
+
+
+def test_wandb_tags_are_derived_from_the_table_row():
+    assert EXPERIMENTS_BY_ID["EX-1"].wandb_tags() == (
+        "EX-1", "dataset_realistic", "phase-a", "dataset-realistic",
+        "epochs-50", "patience-0", "no-aug-a",
+    )
+    assert EXPERIMENTS_BY_ID["EX-2"].wandb_tags() == (
+        "EX-2", "pred_dataset_realistic_augB", "phase-b", "dataset-realistic",
+        "epochs-30", "patience-0", "aug-b", "anchors-predicted",
+        "stage-a-dataset_realistic", "no-aug-a",
+    )
+    assert EXPERIMENTS_BY_ID["EX-5"].wandb_tags() == (
+        "EX-5", "oracle_dataset_realistic", "phase-b", "dataset-realistic",
+        "epochs-30", "patience-0", "no-aug-b", "anchors-oracle",
+    )
 
 
 def test_stage_a_flags_are_explicit_and_do_not_rely_on_config_defaults():
@@ -47,14 +86,20 @@ def test_stage_a_flags_are_explicit_and_do_not_rely_on_config_defaults():
     --epochs 50 \\
     --early-stopping-patience 0 \\
     --early-stopping-min-delta 0.005 \\
-    --wandb-project relational-3d-vlm-realistic \\
+    --wandb-project relational-3d-vlm-phase-a \\
+    --wandb-tag EX-1 \\
+    --wandb-tag dataset_realistic \\
+    --wandb-tag phase-a \\
+    --wandb-tag dataset-realistic \\
+    --wandb-tag epochs-50 \\
+    --wandb-tag patience-0 \\
+    --wandb-tag no-aug-a \\
     --no-augment"""
     command_aug = documented_training_command(EXPERIMENTS_BY_ID["EX-3"])
     assert "--augment" in command_aug
     assert "--no-augment" not in command_aug
     assert EXPERIMENTS_BY_ID["EX-1"].epochs == 50
     assert EXPERIMENTS_BY_ID["EX-1"].early_stopping_patience == 0
-    assert EXPERIMENTS_BY_ID["EX-1"].wandb_project == "relational-3d-vlm-realistic"
 
 
 def test_predicted_stage_b_names_the_stage_a_checkpoint_and_turns_aug_on():
@@ -70,7 +115,17 @@ def test_predicted_stage_b_names_the_stage_a_checkpoint_and_turns_aug_on():
     --epochs 30 \\
     --early-stopping-patience 0 \\
     --early-stopping-min-delta 0.005 \\
-    --wandb-project relational-3d-vlm-realistic \\
+    --wandb-project relational-3d-vlm-phase-b \\
+    --wandb-tag EX-2 \\
+    --wandb-tag pred_dataset_realistic_augB \\
+    --wandb-tag phase-b \\
+    --wandb-tag dataset-realistic \\
+    --wandb-tag epochs-30 \\
+    --wandb-tag patience-0 \\
+    --wandb-tag aug-b \\
+    --wandb-tag anchors-predicted \\
+    --wandb-tag stage-a-dataset_realistic \\
+    --wandb-tag no-aug-a \\
     --augment"""
 
 
@@ -87,7 +142,17 @@ def test_augA_predicted_stage_b_points_at_the_augmented_stage_a():
     --epochs 30 \\
     --early-stopping-patience 0 \\
     --early-stopping-min-delta 0.005 \\
-    --wandb-project relational-3d-vlm-realistic \\
+    --wandb-project relational-3d-vlm-phase-b \\
+    --wandb-tag EX-4 \\
+    --wandb-tag pred_dataset_realistic_augA_augB \\
+    --wandb-tag phase-b \\
+    --wandb-tag dataset-realistic \\
+    --wandb-tag epochs-30 \\
+    --wandb-tag patience-0 \\
+    --wandb-tag aug-b \\
+    --wandb-tag anchors-predicted \\
+    --wandb-tag stage-a-dataset_realistic_aug \\
+    --wandb-tag aug-a \\
     --augment"""
 
 
@@ -103,7 +168,15 @@ def test_oracle_stage_b_has_no_stage_a_and_turns_aug_off():
     --epochs 30 \\
     --early-stopping-patience 0 \\
     --early-stopping-min-delta 0.005 \\
-    --wandb-project relational-3d-vlm-realistic \\
+    --wandb-project relational-3d-vlm-phase-b \\
+    --wandb-tag EX-5 \\
+    --wandb-tag oracle_dataset_realistic \\
+    --wandb-tag phase-b \\
+    --wandb-tag dataset-realistic \\
+    --wandb-tag epochs-30 \\
+    --wandb-tag patience-0 \\
+    --wandb-tag no-aug-b \\
+    --wandb-tag anchors-oracle \\
     --no-augment"""
     assert "--stage-a-checkpoint" not in command
 
@@ -131,6 +204,9 @@ def test_schedule_flags_are_on_every_training_command():
         assert argv[argv.index("--early-stopping-patience") + 1] == str(experiment.early_stopping_patience)
         assert argv[argv.index("--early-stopping-min-delta") + 1] == str(experiment.early_stopping_min_delta)
         assert argv[argv.index("--wandb-project") + 1] == experiment.wandb_project
+        for tag in experiment.wandb_tags():
+            assert tag in argv
+            assert argv[argv.index("--wandb-tag") :].count(tag) >= 1
         assert "--wandb-project" not in (evaluate_argv(experiment, ctx) or [])
 
 
